@@ -32,12 +32,13 @@ async function polygon(pathname) {
 }
 
 const symbols = [
+  'SPY','QQQ',
   'AAPL','MSFT','NVDA','AMZN','META','GOOGL','AVGO','TSLA',
   'JPM','LLY','V','MA','UNH','XOM','COST','NFLX','HD','PG',
   'ABBV','CRM','AMD','QCOM','ORCL','BAC','KO','PEP','CSCO',
   'WMT','MCD','ADBE','IBM','GE','CAT','GS','INTC','MRK',
   'DIS','TMO','AMGN','TXN','RGTI','SOUN','NEE','TE','SOFI','HIMS',
-  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP','SPY','QQQ'
+  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP'
 ];
 
 function timeframeToPolygon(tf) {
@@ -87,7 +88,7 @@ app.get('/api/stocks', async (req, res) => {
 
     const out = [];
 
-    for (const ticker of tickers.slice(0, 60)) {
+    for (const ticker of tickers) {
       try {
         const data = await polygon(
           `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=50`
@@ -103,7 +104,6 @@ app.get('/api/stocks', async (req, res) => {
         const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
 
         const orderedCandles = candles.slice().reverse();
-
         const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
 
         out.push(
@@ -150,21 +150,70 @@ app.listen(PORT, () => {
 
 function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candles = []) {
   const sectorMap = {
-    AAPL:'Technology', MSFT:'Technology', NVDA:'Technology', AMD:'Technology',
-    QCOM:'Technology', AVGO:'Technology', ORCL:'Technology', CRM:'Technology',
-    PLTR:'AI / Software', MU:'Semiconductors', SMCI:'Semiconductors',
-    ARM:'Semiconductors', CRWD:'Cybersecurity', APP:'AI / Software',
-    AMZN:'Consumer', META:'Technology', GOOGL:'Technology', TSLA:'Consumer',
-    JPM:'Financials', BAC:'Financials', GS:'Financials', V:'Financials', MA:'Financials',
-    LLY:'Healthcare', UNH:'Healthcare', ABBV:'Healthcare', MRK:'Healthcare',
-    TMO:'Healthcare', AMGN:'Healthcare', XOM:'Energy', COST:'Consumer',
-    NFLX:'Communication', HD:'Consumer', PG:'Consumer', KO:'Consumer',
-    PEP:'Consumer', CSCO:'Technology', WMT:'Consumer', MCD:'Consumer',
-    ADBE:'Technology', IBM:'Technology', GE:'Industrials', CAT:'Industrials',
-    INTC:'Semiconductors', DIS:'Communication', TXN:'Semiconductors',
-    RGTI:'Quantum', IONQ:'Quantum', QBTS:'Quantum', SOUN:'AI',
-    RKLB:'Space', ASTS:'Space', NEE:'Utilities', TE:'Industrials',
-    SOFI:'Financials', HIMS:'Healthcare'
+    SPY:'ETF',
+    QQQ:'ETF',
+
+    AAPL:'Technology',
+    MSFT:'Technology',
+    NVDA:'Technology',
+    AMD:'Technology',
+    QCOM:'Technology',
+    AVGO:'Technology',
+    ORCL:'Technology',
+    CRM:'Technology',
+    PLTR:'AI / Software',
+    MU:'Semiconductors',
+    SMCI:'Semiconductors',
+    ARM:'Semiconductors',
+    CRWD:'Cybersecurity',
+    APP:'AI / Software',
+
+    AMZN:'Consumer',
+    META:'Technology',
+    GOOGL:'Technology',
+    TSLA:'Consumer',
+
+    JPM:'Financials',
+    BAC:'Financials',
+    GS:'Financials',
+    V:'Financials',
+    MA:'Financials',
+
+    LLY:'Healthcare',
+    UNH:'Healthcare',
+    ABBV:'Healthcare',
+    MRK:'Healthcare',
+    TMO:'Healthcare',
+    AMGN:'Healthcare',
+
+    XOM:'Energy',
+    COST:'Consumer',
+    NFLX:'Communication',
+    HD:'Consumer',
+    PG:'Consumer',
+    KO:'Consumer',
+    PEP:'Consumer',
+    CSCO:'Technology',
+    WMT:'Consumer',
+    MCD:'Consumer',
+    ADBE:'Technology',
+    IBM:'Technology',
+    GE:'Industrials',
+    CAT:'Industrials',
+    INTC:'Semiconductors',
+    DIS:'Communication',
+    TXN:'Semiconductors',
+
+    RGTI:'Quantum',
+    IONQ:'Quantum',
+    QBTS:'Quantum',
+    SOUN:'AI',
+    RKLB:'Space',
+    ASTS:'Space',
+    NEE:'Utilities',
+    TE:'Industrials',
+    SOFI:'Financials',
+    HIMS:'Healthcare'
   };
 
   const closes = candles.length ? candles.map(c => c.c) : spark || [];
@@ -203,11 +252,17 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
       : 'Consolidation';
 
   let score = 70;
+
   if (bullishTrend) score += 10;
   if (nearResistance) score += 8;
   if (volumeSpike) score += 7;
   if (change > 0) score += 4;
   if (price > support && price < resistance) score += 3;
+
+  if (ticker === 'SPY' || ticker === 'QQQ') {
+    score += 3;
+  }
+
   score = Math.min(99, score);
 
   const entry =
