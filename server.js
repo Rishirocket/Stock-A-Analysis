@@ -7,6 +7,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 const API_KEY =
   process.env.MASSIVE_API_KEY ||
   process.env.POLYGON_API_KEY ||
@@ -14,9 +15,7 @@ const API_KEY =
 
 async function polygon(pathname) {
   if (!API_KEY) {
-    throw new Error(
-      'Missing MASSIVE_API_KEY or POLYGON_API_KEY in Railway Variables'
-    );
+    throw new Error('Missing MASSIVE_API_KEY or POLYGON_API_KEY in Railway Variables');
   }
 
   const url = `https://api.polygon.io${pathname}${
@@ -72,15 +71,16 @@ app.get('/api/stocks', async (req, res) => {
       return res.json({
         live: false,
         timeframe,
-        message:
-          'Add MASSIVE_API_KEY in Railway Variables to enable live data.',
+        message: 'Add MASSIVE_API_KEY in Railway Variables to enable live data.',
         stocks: demoStocks(timeframe)
       });
     }
 
-    const tickers = (
-      req.query.tickers || symbols.join(',')
-    ).split(',').slice(0, 100);
+    const tickers = (req.query.tickers || symbols.join(','))
+      .split(',')
+      .map(t => t.trim().toUpperCase())
+      .filter(Boolean)
+      .slice(0, 100);
 
     const from = dateAgo(tf.daysBack);
     const to = new Date().toISOString().slice(0, 10);
@@ -90,7 +90,7 @@ app.get('/api/stocks', async (req, res) => {
     for (const ticker of tickers.slice(0, 60)) {
       try {
         const data = await polygon(
-          `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=30`
+          `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=50`
         );
 
         const candles = data.results || [];
@@ -101,10 +101,10 @@ app.get('/api/stocks', async (req, res) => {
 
         const price = Number(latest.c.toFixed(2));
         const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
-        const spark = candles
-          .slice()
-          .reverse()
-          .map(c => Number(c.c.toFixed(2)));
+
+        const orderedCandles = candles.slice().reverse();
+
+        const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
 
         out.push(
           makeStock(
@@ -113,7 +113,8 @@ app.get('/api/stocks', async (req, res) => {
             change,
             latest.v,
             spark,
-            timeframe
+            timeframe,
+            orderedCandles
           )
         );
       } catch (e) {
@@ -121,10 +122,12 @@ app.get('/api/stocks', async (req, res) => {
       }
     }
 
+    const sorted = out.length ? out.sort((a, b) => b.score - a.score) : demoStocks(timeframe);
+
     res.json({
       live: true,
       timeframe,
-      stocks: out.length ? out : demoStocks(timeframe)
+      stocks: sorted
     });
   } catch (err) {
     res.status(500).json({
@@ -138,16 +141,14 @@ app.get('/api/stocks', async (req, res) => {
 app.use(express.static(path.join(__dirname, 'dist')));
 
 app.get('/*splat', (req, res) => {
-  res.sendFile(
-    path.join(__dirname, 'dist', 'index.html')
-  );
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
 app.listen(PORT, () => {
   console.log(`A+ Stocks running on port ${PORT}`);
 });
 
-function makeStock(ticker, price, change, volume, spark, timeframe = '1H') {
+function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candles = []) {
   const sectorMap = {
     AAPL:'Technology', MSFT:'Technology', NVDA:'Technology', AMD:'Technology',
     QCOM:'Technology', AVGO:'Technology', ORCL:'Technology', CRM:'Technology',
@@ -166,31 +167,77 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H') {
     SOFI:'Financials', HIMS:'Healthcare'
   };
 
-  const score = 70 + Math.floor(Math.random() * 30);
+  const closes = candles.length ? candles.map(c => c.c) : spark || [];
+  const highs = candles.length ? candles.map(c => c.h) : closes;
+  const lows = candles.length ? candles.map(c => c.l) : closes;
+  const volumes = candles.length ? candles.map(c => c.v || 0) : [volume || 0];
 
-  const entryMultiplier =
-    timeframe === '5M' ? 1.004 :
-    timeframe === '15M' ? 1.007 :
-    timeframe === '1H' ? 1.012 :
-    timeframe === '1D' ? 1.02 :
-    1.04;
+  const recentHigh = Math.max(...highs.slice(-20));
+  const recentLow = Math.min(...lows.slice(-20));
 
-  const stopMultiplier =
-    timeframe === '5M' ? 0.994 :
-    timeframe === '15M' ? 0.99 :
-    timeframe === '1H' ? 0.985 :
-    timeframe === '1D' ? 0.97 :
-    0.94;
+  const support = Number(recentLow.toFixed(2));
+  const resistance = Number(recentHigh.toFixed(2));
 
-  const entry = +(price * entryMultiplier).toFixed(2);
-  const stop = +(price * stopMultiplier).toFixed(2);
+  const avgVolume =
+    volumes.reduce((sum, v) => sum + v, 0) / Math.max(volumes.length, 1);
 
-  const t1 = +(entry + (entry - stop) * 2.1).toFixed(2);
-  const t2 = +(entry + (entry - stop) * 3.5).toFixed(2);
+  const volumeSpike = volume > avgVolume * 1.5;
 
-  const rr = +((t1 - entry) / (entry - stop)).toFixed(1);
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
 
-  const pctToEntry = +(((entry - price) / price) * 100).toFixed(2);
+  const bullishTrend = ema9 > ema21 && price > ema9;
+
+  const nearResistance =
+    resistance > 0 ? ((resistance - price) / price) * 100 <= 1.5 : false;
+
+  const pattern =
+    nearResistance && bullishTrend
+      ? 'Breakout setup'
+      : bullishTrend && volumeSpike
+      ? 'Momentum continuation'
+      : price <= support * 1.02
+      ? 'Support bounce watch'
+      : change < -1.5
+      ? 'Pullback / wait'
+      : 'Consolidation';
+
+  let score = 70;
+  if (bullishTrend) score += 10;
+  if (nearResistance) score += 8;
+  if (volumeSpike) score += 7;
+  if (change > 0) score += 4;
+  if (price > support && price < resistance) score += 3;
+  score = Math.min(99, score);
+
+  const entry =
+    pattern === 'Breakout setup'
+      ? Number((resistance * 1.002).toFixed(2))
+      : Number((price * 1.012).toFixed(2));
+
+  const stop =
+    pattern === 'Support bounce watch'
+      ? Number((support * 0.995).toFixed(2))
+      : Number((Math.max(support * 0.995, price * 0.985)).toFixed(2));
+
+  const risk = Math.max(entry - stop, price * 0.005);
+
+  const t1 = Number((entry + risk * 2.1).toFixed(2));
+  const t2 = Number((entry + risk * 3.5).toFixed(2));
+
+  const rr = Number(((t1 - entry) / risk).toFixed(1));
+
+  const pctToEntry = Number((((entry - price) / price) * 100).toFixed(2));
+
+  const status =
+    pctToEntry <= 1
+      ? 'Alert'
+      : pctToEntry <= 3
+      ? 'Watch'
+      : 'Waiting';
+
+  const analysis =
+    `Support $${support} | Resistance $${resistance} | Pattern: ${pattern}`;
 
   return {
     ticker,
@@ -205,23 +252,44 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H') {
     t2,
     rr,
     pctToEntry,
-    status: pctToEntry < 1 ? 'Alert' : 'Watch',
+    support,
+    resistance,
+    pattern,
+    analysis,
+    bullishTrend,
+    volumeSpike,
+    status,
     spark: spark && spark.length ? spark : Array.from(
       { length: 12 },
-      () => +(price * (0.97 + Math.random() * 0.06)).toFixed(2)
+      () => Number((price * (0.97 + Math.random() * 0.06)).toFixed(2))
     )
   };
 }
 
+function ema(values, period) {
+  if (!values.length) return 0;
+
+  const k = 2 / (period + 1);
+  let result = values[0];
+
+  for (let i = 1; i < values.length; i++) {
+    result = values[i] * k + result * (1 - k);
+  }
+
+  return result;
+}
+
 function demoStocks(timeframe = '1H') {
-  return symbols.map((s, i) =>
-    makeStock(
-      s,
-      80 + Math.random() * 420,
-      -2 + Math.random() * 5,
-      1000000 + i,
-      null,
-      timeframe
+  return symbols
+    .map((s, i) =>
+      makeStock(
+        s,
+        80 + Math.random() * 420,
+        -2 + Math.random() * 5,
+        1000000 + i,
+        null,
+        timeframe
+      )
     )
-  );
+    .sort((a, b) => b.score - a.score);
 }
