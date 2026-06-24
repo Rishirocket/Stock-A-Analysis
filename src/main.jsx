@@ -7,6 +7,7 @@ function rrClass(rr){ return rr>=2?'good':rr>=1.5?'watch':'bad'; }
 function pctClass(p){ return p<=1?'near':p<=3?'mid':'far'; }
 
 function Spark({data=[]}){
+  if(!data.length) return null;
   const min=Math.min(...data), max=Math.max(...data), range=max-min||1;
   const pts=data.map((v,i)=>`${(i/(data.length-1))*100},${34-((v-min)/range)*28}`).join(' ');
   return <svg className="spark" viewBox="0 0 100 40"><polyline points={pts}/></svg>
@@ -20,6 +21,7 @@ function App(){
   const [live,setLive]=useState(false);
   const [timeframe,setTimeframe]=useState('1H');
   const [loading,setLoading]=useState(false);
+  const [scoreSort,setScoreSort]=useState('desc');
 
   useEffect(()=>{
     setLoading(true);
@@ -33,14 +35,28 @@ function App(){
       .finally(()=>setLoading(false));
   },[timeframe]);
 
-  const filtered=useMemo(()=>stocks.filter(s=>
-    (!q||s.ticker.toLowerCase().includes(q.toLowerCase())||s.sector.toLowerCase().includes(q.toLowerCase()))
-    && (!rrOnly||s.rr>=2)
-  ),[stocks,q,rrOnly]);
+  const filtered=useMemo(()=>{
+    const search=q.trim().toLowerCase();
+
+    return stocks
+      .filter(s=>
+        (!search ||
+          String(s.ticker || '').toLowerCase().includes(search) ||
+          String(s.sector || '').toLowerCase().includes(search)
+        ) && (!rrOnly || Number(s.rr)>=2)
+      )
+      .sort((a,b)=>scoreSort==='desc'
+        ? Number(b.score)-Number(a.score)
+        : Number(a.score)-Number(b.score)
+      );
+  },[stocks,q,rrOnly,scoreSort]);
 
   const exportCsv=()=>{
-    const cols=['ticker','score','price','pctToEntry','entry','stop','t1','t2','rr','volumeRank','sector','status'];
-    const csv=[cols.join(','),...filtered.map(s=>cols.map(c=>s[c]).join(','))].join('\n');
+    const cols=[
+      'ticker','score','price','pctToEntry','entry','stop','t1','t2',
+      'rr','volumeRank','sector','status','support','resistance','pattern','analysis'
+    ];
+    const csv=[cols.join(','),...filtered.map(s=>cols.map(c=>`"${s[c] ?? ''}"`).join(','))].join('\n');
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
     a.download=`a-plus-stocks-${timeframe}.csv`;
@@ -54,13 +70,13 @@ function App(){
           {live?'LIVE POLYGON/MASSIVE DATA':'DEMO DATA - ADD API KEY IN RAILWAY'} • TIMEFRAME {timeframe}
         </p>
         <h1>A+ Stocks</h1>
-        <p>Premium S&P 500 screener with entry, stop, targets and R:R plans.</p>
+        <p>Premium S&P 500 screener with entry, stop, targets, support, resistance and R:R plans.</p>
       </div>
       <button onClick={exportCsv}>Export CSV</button>
     </header>
 
     <section className="toolbar">
-      <input placeholder="Search ticker or sector" value={q} onChange={e=>setQ(e.target.value)}/>
+      <input placeholder="Search ticker or sector, example: rgti" value={q} onChange={e=>setQ(e.target.value)}/>
 
       <div className="timeframes">
         {['5M','15M','1H','1D','1W'].map(tf=>(
@@ -89,7 +105,7 @@ function App(){
 
     {view==='grid'
       ? <div className="grid">{filtered.map(s=><Card key={s.ticker} s={s}/>)}</div>
-      : <Table rows={filtered}/>
+      : <Table rows={filtered} scoreSort={scoreSort} setScoreSort={setScoreSort}/>
     }
   </main>
 }
@@ -112,10 +128,10 @@ function Card({s}){
     <Spark data={s.spark}/>
 
     <div className="checks">
-      <p>✓ Bullish trend</p>
-      <p>✓ Above 9/21 EMA</p>
-      <p>✓ POC below price</p>
-      <p>{s.volumeRank<50?'✓':'×'} Volume &gt; 2x avg</p>
+      <p>{s.bullishTrend ? '✓' : '×'} Bullish trend</p>
+      <p>{s.bullishTrend ? '✓' : '×'} Above 9/21 EMA</p>
+      <p>✓ Support below price</p>
+      <p>{s.volumeSpike ? '✓' : '×'} Volume spike</p>
       <p>{s.pctToEntry<=1?'✓':'×'} Near breakout</p>
     </div>
 
@@ -123,19 +139,47 @@ function Card({s}){
       Entry: ${s.entry} | Stop: ${s.stop} | T1: ${s.t1} | T2: ${s.t2} | R:R {s.rr}:1
     </div>
 
+    <div className="analysis">
+      <strong>Chart Analysis</strong><br/>
+      Support: ${s.support ?? '-'} | Resistance: ${s.resistance ?? '-'}<br/>
+      Pattern: {s.pattern ?? 'Checking pattern'}
+    </div>
+
     <footer>
-      <span className={s.pctToEntry<=1?'hot':''}>{s.pctToEntry<=1?'Near Breakout':'Watch'}</span>
+      <span className={s.pctToEntry<=1?'hot':''}>{s.status || 'Watch'}</span>
       <button>View Plan</button>
     </footer>
   </article>
 }
 
-function Table({rows}){
+function Table({rows,scoreSort,setScoreSort}){
+  const toggleScoreSort=()=>{
+    setScoreSort(scoreSort==='desc'?'asc':'desc');
+  };
+
   return <div className="tableWrap">
     <table>
       <thead>
         <tr>
-          {['Rank','Ticker','Score','Price','% to Entry','Entry','Stop','T1','T2','R:R','Volume Rank','Sector','Status','Action'].map(h=><th key={h}>{h}</th>)}
+          <th>Rank</th>
+          <th>Ticker</th>
+          <th className="sortable" onClick={toggleScoreSort}>
+            Score {scoreSort==='desc'?'↓':'↑'}
+          </th>
+          <th>Price</th>
+          <th>% to Entry</th>
+          <th>Entry</th>
+          <th>Stop</th>
+          <th>T1</th>
+          <th>T2</th>
+          <th>R:R</th>
+          <th>Support</th>
+          <th>Resistance</th>
+          <th>Pattern</th>
+          <th>Volume Rank</th>
+          <th>Sector</th>
+          <th>Status</th>
+          <th>Action</th>
         </tr>
       </thead>
       <tbody>
@@ -151,6 +195,9 @@ function Table({rows}){
             <td>${s.t1}</td>
             <td>${s.t2}</td>
             <td>{s.rr}:1</td>
+            <td>${s.support ?? '-'}</td>
+            <td>${s.resistance ?? '-'}</td>
+            <td>{s.pattern ?? '-'}</td>
             <td>{s.volumeRank}</td>
             <td>{s.sector}</td>
             <td><span className="status">{s.status}</span></td>
