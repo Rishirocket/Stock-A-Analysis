@@ -37,7 +37,7 @@ const symbols = [
   'ABBV','CRM','AMD','QCOM','ORCL','BAC','KO','PEP','CSCO',
   'WMT','MCD','ADBE','IBM','GE','CAT','GS','INTC','MRK',
   'DIS','TMO','AMGN','TXN','RGTI','SOUN','NEE','TE','SOFI','HIMS',
-  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP'
+  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP','SPY','QQQ'
 ];
 
 function timeframeToPolygon(tf) {
