@@ -37,7 +37,7 @@ const symbols = [
   'JPM','LLY','V','MA','UNH','XOM','COST','NFLX','HD','PG',
   'ABBV','CRM','AMD','QCOM','ORCL','BAC','KO','PEP','CSCO',
   'WMT','MCD','ADBE','IBM','GE','CAT','GS','INTC','MRK',
-  'DIS','TMO','AMGN','TXN'
+  'DIS','TMO','AMGN','TXN','RGTI','SOUN','NEE','TE','SOFI','HIMS'
 ];
 
 app.get('/api/stocks', async (req, res) => {
