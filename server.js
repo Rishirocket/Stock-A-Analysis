@@ -179,6 +179,9 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const resistance = Number(recentHigh.toFixed(2));
 
   const avgVolume = volumes.reduce((sum, v) => sum + v, 0) / Math.max(volumes.length, 1);
+  const avgVolumeRounded = Math.round(avgVolume);
+  const currentVolume = Math.round(volume);
+
   const rvol = Number((volume / Math.max(avgVolume, 1)).toFixed(2));
   const volumeSpike = rvol >= 1.5;
 
@@ -221,26 +224,27 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
       ? 'Pullback / wait'
       : 'No clean setup';
 
-  let score = 0;
+  const scoreBreakdown = {
+    bullishTrend: bullishTrend ? 15 : 0,
+    above50EMA: above50 ? 8 : 0,
+    above200EMA: above200 ? 8 : 0,
+    relativeStrength: relativeStrength > 1 ? 12 : 0,
+    rvol: rvol >= 2 ? 12 : rvol >= 1.5 ? 8 : 0,
+    supportResistance: nearResistance || nearSupport ? 10 : 0,
+    pattern: pattern.includes('setup') ? 12 : 0,
+    bollingerMiddle: bb.aboveMiddle ? 5 : 0,
+    bollingerUpper: bb.nearUpper && bullishTrend ? 5 : 0,
+    bollingerSqueeze: bb.squeeze && bullishTrend ? 5 : 0,
+    newsCatalyst: hasNewsCatalyst ? 10 : 0,
+    liquidity:
+      dollarVolume > 1000000000 ? 10 :
+      dollarVolume > 500000000 ? 7 :
+      dollarVolume > 100000000 ? 4 : 0,
+    atrExpansion: atrExpansion ? 8 : 0,
+    marketETF: ticker === 'SPY' || ticker === 'QQQ' ? 5 : 0
+  };
 
-  if (bullishTrend) score += 15;
-  if (above50) score += 8;
-  if (above200) score += 8;
-  if (relativeStrength > 1) score += 12;
-  if (rvol >= 2) score += 12;
-  else if (rvol >= 1.5) score += 8;
-  if (nearResistance || nearSupport) score += 10;
-  if (pattern.includes('setup')) score += 12;
-  if (bb.aboveMiddle) score += 5;
-  if (bb.nearUpper && bullishTrend) score += 5;
-  if (bb.squeeze && bullishTrend) score += 5;
-  if (hasNewsCatalyst) score += 10;
-  if (dollarVolume > 1000000000) score += 10;
-  else if (dollarVolume > 500000000) score += 7;
-  else if (dollarVolume > 100000000) score += 4;
-  if (atrExpansion) score += 8;
-  if (ticker === 'SPY' || ticker === 'QQQ') score += 5;
-
+  let score = Object.values(scoreBreakdown).reduce((a, b) => a + b, 0);
   score = Math.min(99, Math.round(score));
 
   const buffer = Math.max(atr * 0.1, price * 0.001);
@@ -279,29 +283,49 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     ticker,
     sector: sectorMap[ticker] || 'Other',
     score,
+    scoreBreakdown,
+
     price,
     change,
+
+    ema9,
+    ema21,
+    ema50,
+    ema200,
+    above50,
+    above200,
+
+    avgVolume: avgVolumeRounded,
+    currentVolume,
     volumeRank: Math.ceil(Math.random() * 100),
+    volumeSpike,
+    rvol,
+
+    dollarVolume,
+
     entry,
     stop,
     t1,
     t2,
     rr,
     pctToEntry,
+
     support,
     resistance,
+
+    atr,
+    atrExpansion,
+
+    bollinger: bb,
+
+    relativeStrength,
+
+    hasNewsCatalyst,
+    newsTitle,
+
     pattern,
     analysis: `Support $${support} | Resistance $${resistance} | Pattern: ${pattern}`,
     bullishTrend,
-    volumeSpike,
-    rvol,
-    relativeStrength,
-    dollarVolume,
-    atr,
-    atrExpansion,
-    bollinger: bb,
-    hasNewsCatalyst,
-    newsTitle,
     status,
     spark: spark && spark.length ? spark : []
   };
@@ -309,6 +333,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
 
 function ema(values, period) {
   if (!values.length) return 0;
+
   const k = 2 / (period + 1);
   let result = values[0];
 
@@ -344,7 +369,15 @@ function calculateATR(candles, period = 14) {
 
 function bollingerBands(values, period = 20, multiplier = 2) {
   if (!values || values.length < period) {
-    return { upper: 0, middle: 0, lower: 0, width: 0, squeeze: false, aboveMiddle: false, nearUpper: false };
+    return {
+      upper: 0,
+      middle: 0,
+      lower: 0,
+      width: 0,
+      squeeze: false,
+      aboveMiddle: false,
+      nearUpper: false
+    };
   }
 
   const recent = values.slice(-period);
