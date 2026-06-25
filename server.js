@@ -8,6 +8,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const CONFIG = {
+  dataDelayMinutes: 15,
+  delayedDataMode: true,
+  optionsMode: false
+};
+
 const API_KEY = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '';
 
 async function polygon(pathname) {
@@ -22,13 +28,19 @@ async function polygon(pathname) {
 }
 
 const symbols = [
-  'SPY','QQQ',
+  'SPY','QQQ','XBI',
   'AAPL','MSFT','NVDA','AMZN','META','GOOGL','AVGO','TSLA',
   'JPM','LLY','V','MA','UNH','XOM','COST','NFLX','HD','PG',
   'ABBV','CRM','AMD','QCOM','ORCL','BAC','KO','PEP','CSCO',
   'WMT','MCD','ADBE','IBM','GE','CAT','GS','INTC','MRK',
   'DIS','TMO','AMGN','TXN','RGTI','SOUN','NEE','TE','SOFI','HIMS',
-  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP'
+  'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP',
+
+  'RXT','NVO','MRNA','WEN','RUN','AAL','TEM','UBER','JBLU',
+  'LOW','HON','FOX','TER','BULL','DRAM','NOK','AIR','BRK.B',
+  'CDW','SNOW','OSCR','SWKS','RDDT','AMKR','CRWV','MARA',
+  'COIN','HOOD','WULF','EOSE','QUBT','NVTS','GLXY','HYLN',
+  'WYFI','FPS','MRVL','ONDS','GH','ILMN','DELL','CBRS','BE'
 ];
 
 function timeframeToPolygon(tf) {
@@ -124,6 +136,8 @@ app.get('/api/stocks', async (req, res) => {
     res.json({
       live: true,
       timeframe,
+      delayMinutes: CONFIG.dataDelayMinutes,
+      delayedDataMode: CONFIG.delayedDataMode,
       stocks: stocks.length ? stocks : demoStocks(timeframe)
     });
 
@@ -148,7 +162,7 @@ app.listen(PORT, () => {
 
 function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candles = [], spyChange = 0, news = []) {
   const sectorMap = {
-    SPY:'ETF', QQQ:'ETF',
+    SPY:'ETF', QQQ:'ETF', XBI:'Biotech ETF',
     AAPL:'Technology', MSFT:'Technology', NVDA:'Technology', AMD:'Technology',
     QCOM:'Technology', AVGO:'Technology', ORCL:'Technology', CRM:'Technology',
     PLTR:'AI / Software', MU:'Semiconductors', SMCI:'Semiconductors',
@@ -161,9 +175,23 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     PEP:'Consumer', CSCO:'Technology', WMT:'Consumer', MCD:'Consumer',
     ADBE:'Technology', IBM:'Technology', GE:'Industrials', CAT:'Industrials',
     INTC:'Semiconductors', DIS:'Communication', TXN:'Semiconductors',
-    RGTI:'Quantum', IONQ:'Quantum', QBTS:'Quantum', SOUN:'AI',
-    RKLB:'Space', ASTS:'Space', NEE:'Utilities', TE:'Industrials',
-    SOFI:'Financials', HIMS:'Healthcare'
+    RGTI:'Quantum', IONQ:'Quantum', QBTS:'Quantum', QUBT:'Quantum',
+    SOUN:'AI', RKLB:'Space', ASTS:'Space', NEE:'Utilities', TE:'Industrials',
+    SOFI:'Financials', HIMS:'Healthcare',
+
+    RXT:'Software', NVO:'Healthcare', MRNA:'Healthcare', WEN:'Consumer',
+    RUN:'Solar', AAL:'Airlines', TEM:'AI / Healthcare', UBER:'Technology',
+    JBLU:'Airlines', LOW:'Consumer', HON:'Industrials', FOX:'Communication',
+    TER:'Semiconductors', BULL:'Financials', DRAM:'Semiconductors',
+    NOK:'Technology', AIR:'Industrials', 'BRK.B':'Financials',
+    CDW:'Technology', SNOW:'Software', OSCR:'Healthcare',
+    SWKS:'Semiconductors', RDDT:'Social Media', AMKR:'Semiconductors',
+    CRWV:'AI / Cloud', MARA:'Crypto', COIN:'Crypto', HOOD:'Financials',
+    WULF:'Crypto', EOSE:'Energy Storage', NVTS:'Semiconductors',
+    GLXY:'Crypto', HYLN:'Clean Energy', WYFI:'Technology',
+    FPS:'Technology', MRVL:'Semiconductors', ONDS:'Technology',
+    GH:'Healthcare', ILMN:'Healthcare', DELL:'Technology',
+    CBRS:'Technology', BE:'Clean Energy'
   };
 
   const closes = candles.length ? candles.map(c => c.c) : spark || [];
@@ -184,7 +212,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
 
   const rvol = Number((volume / Math.max(avgVolume, 1)).toFixed(2));
   const volumeSpike = rvol >= 1.5;
-
   const dollarVolume = Number((price * volume).toFixed(0));
 
   const ema9 = ema(closes, 9);
@@ -213,7 +240,10 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const avgVol20 = avg(volumes.slice(-20));
   const last3Lows = lows.slice(-3);
 
-  const tightRange = atr > 0 && oldATR > 0 && atr < oldATR * 0.6;
+  const delayMultiplier = CONFIG.delayedDataMode ? 1.5 : 1.0;
+  const entryZoneBuffer = CONFIG.delayedDataMode ? 0.015 : 0.008;
+
+  const tightRange = atr > 0 && oldATR > 0 && atr < oldATR * 0.6 * delayMultiplier;
   const rangeContraction = avgRange3 > 0 && avgRange20 > 0 && avgRange3 < avgRange20 * 0.5;
   const volDryUp = avgVol5 > 0 && avgVol20 > 0 && avgVol5 < avgVol20 * 0.7;
   const volExpansionSetup = volume < avgVol10 && nearResistance;
@@ -227,9 +257,14 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     ? Number((((resistance - price) / price) * 100).toFixed(2))
     : null;
 
-  const proximityToEntry =
+  const prePositionZone =
     distanceToEntry !== null &&
     distanceToEntry > 0 &&
+    distanceToEntry < entryZoneBuffer * 100;
+
+  const proximityToTrigger =
+    distanceToEntry !== null &&
+    distanceToEntry >= 0 &&
     distanceToEntry < 0.8;
 
   const vwap = calculateVWAP(candles);
@@ -283,7 +318,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
       ? 'Cup and handle setup'
       : flagPole
       ? 'Bull flag setup'
-      : tightRange && volDryUp && proximityToEntry
+      : tightRange && volDryUp && prePositionZone
       ? 'Coiled pre-breakout setup'
       : nearResistance && bullishTrend
       ? 'Breakout setup'
@@ -302,36 +337,54 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     above50EMA: above50 ? 8 : 0,
     above200EMA: above200 ? 8 : 0,
     relativeStrength: relativeStrength > 1 ? 12 : 0,
-    rvol: rvol >= 2 ? 12 : rvol >= 1.5 ? 8 : 0,
 
-    tightRange: tightRange ? 10 : 0,
-    rangeContraction: rangeContraction ? 8 : 0,
-    volDryUp: volDryUp ? 7 : 0,
-    volExpansionSetup: volExpansionSetup ? 5 : 0,
-    proximityToEntry: proximityToEntry ? 10 : 0,
-    higherLows: higherLows ? 8 : 0,
+    tightRange: tightRange ? 12 : 0,
+    rangeContraction: rangeContraction ? 10 : 0,
+    higherLows: higherLows ? 10 : 0,
+    volDryUp: volDryUp ? 10 : 0,
+    volExpansionSetup: volExpansionSetup ? 8 : 0,
+
+    prePositionZone: prePositionZone ? 15 : 0,
+    proximityToTrigger: proximityToTrigger ? 8 : 0,
+
+    rvol: rvol >= 2 ? 8 : rvol >= 1.5 ? 5 : 0,
+    pattern: pattern.includes('setup') ? 8 : 0,
+
     flagPole: flagPole ? 8 : 0,
     cupHandle: cupHandle ? 10 : 0,
     vwapPinning: vwapPinning ? 5 : 0,
 
-    supportResistance: nearResistance || nearSupport ? 10 : 0,
-    pattern: pattern.includes('setup') ? 12 : 0,
     bollingerMiddle: bb.aboveMiddle ? 5 : 0,
-    bollingerUpper: bb.nearUpper && bullishTrend ? 5 : 0,
-    bollingerSqueeze: bb.squeeze && bullishTrend ? 5 : 0,
+    bollingerSqueeze: bb.squeeze && bullishTrend ? 8 : 0,
+
     newsCatalyst: hasNewsCatalyst ? 10 : 0,
+
     liquidity:
       dollarVolume > 1000000000 ? 10 :
       dollarVolume > 500000000 ? 7 :
       dollarVolume > 100000000 ? 4 : 0,
-    atrExpansion: atrExpansion ? 8 : 0,
-    marketETF: ticker === 'SPY' || ticker === 'QQQ' ? 5 : 0
+
+    atrExpansion: atrExpansion ? 5 : 0,
+    marketETF: ticker === 'SPY' || ticker === 'QQQ' ? 5 : 0,
+
+    optionsSetupBonus:
+      CONFIG.optionsMode && tightRange && volDryUp && prePositionZone ? 10 : 0
   };
 
   let score = Object.values(scoreBreakdown).reduce((a, b) => a + b, 0);
   score = Math.min(99, Math.round(score));
 
   const buffer = Math.max(atr * 0.1, price * 0.001);
+
+  const entryZone = resistance > 0
+    ? {
+        trigger: Number((resistance + buffer).toFixed(2)),
+        zoneLow: Number((resistance * (1 - entryZoneBuffer)).toFixed(2)),
+        zoneHigh: Number(resistance.toFixed(2)),
+        mode: CONFIG.delayedDataMode ? 'PRE-POSITION' : 'BREAKOUT',
+        delayMinutes: CONFIG.dataDelayMinutes
+      }
+    : null;
 
   let entry = null;
   let stop = null;
@@ -343,7 +396,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     pattern === 'Cup and handle setup' ||
     pattern === 'Bull flag setup'
   ) {
-    entry = Number((resistance + buffer).toFixed(2));
+    entry = entryZone?.trigger || null;
     stop = Number((Math.min(support - buffer, entry - atr * 1.2)).toFixed(2));
   } else if (pattern === 'Support bounce setup') {
     entry = Number((Math.max(price, highs.at(-1)) + buffer).toFixed(2));
@@ -365,6 +418,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
 
   const status =
     !entry ? 'No Setup' :
+    prePositionZone ? 'Pre-Position Watch' :
     pctToEntry <= 1 ? 'Alert' :
     pctToEntry <= 3 ? 'Watch' :
     'Waiting';
@@ -387,10 +441,8 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
 
     avgVolume: avgVolumeRounded,
     currentVolume,
-    volumeRank: Math.ceil(Math.random() * 100),
     volumeSpike,
     rvol,
-
     dollarVolume,
 
     entry,
@@ -399,11 +451,13 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     t2,
     rr,
     pctToEntry,
+    entryZone,
 
     support,
     resistance,
 
     atr,
+    oldATR,
     atrExpansion,
 
     bollinger: bb,
@@ -421,7 +475,8 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     volDryUp,
     volExpansionSetup,
     distanceToEntry,
-    proximityToEntry,
+    prePositionZone,
+    proximityToTrigger,
     higherLows,
     flagPoleHeight,
     consolidationDays,
@@ -440,13 +495,14 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     analysis: `Support $${support} | Resistance $${resistance} | Pattern: ${pattern}`,
     bullishTrend,
     status,
+    delayedDataMode: CONFIG.delayedDataMode,
+    delayMinutes: CONFIG.dataDelayMinutes,
     spark: spark && spark.length ? spark : []
   };
 }
 
 function ema(values, period) {
   if (!values.length) return 0;
-
   const k = 2 / (period + 1);
   let result = values[0];
 
