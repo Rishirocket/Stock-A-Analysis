@@ -64,7 +64,6 @@ app.get('/api/stocks', async (req, res) => {
 
     const from = dateAgo(tf.daysBack);
     const to = new Date().toISOString().slice(0, 10);
-
     const raw = [];
 
     for (const ticker of tickers) {
@@ -171,6 +170,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const highs = candles.length ? candles.map(c => c.h) : closes;
   const lows = candles.length ? candles.map(c => c.l) : closes;
   const volumes = candles.length ? candles.map(c => c.v || 0) : [volume || 0];
+  const ranges = candles.length ? candles.map(c => c.h - c.l) : [];
 
   const recentHigh = Math.max(...highs.slice(-21, -1));
   const recentLow = Math.min(...lows.slice(-21, -1));
@@ -178,7 +178,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const support = Number(recentLow.toFixed(2));
   const resistance = Number(recentHigh.toFixed(2));
 
-  const avgVolume = volumes.reduce((sum, v) => sum + v, 0) / Math.max(volumes.length, 1);
+  const avgVolume = avg(volumes);
   const avgVolumeRounded = Math.round(avgVolume);
   const currentVolume = Math.round(volume);
 
@@ -206,12 +206,85 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const nearResistance = resistance > 0 ? ((resistance - price) / price) * 100 <= 1.5 : false;
   const nearSupport = support > 0 ? ((price - support) / price) * 100 <= 2 : false;
 
+  const avgRange3 = avg(ranges.slice(-3));
+  const avgRange20 = avg(ranges.slice(-20));
+  const avgVol5 = avg(volumes.slice(-5));
+  const avgVol10 = avg(volumes.slice(-10));
+  const avgVol20 = avg(volumes.slice(-20));
+  const last3Lows = lows.slice(-3);
+
+  const tightRange = atr > 0 && oldATR > 0 && atr < oldATR * 0.6;
+  const rangeContraction = avgRange3 > 0 && avgRange20 > 0 && avgRange3 < avgRange20 * 0.5;
+  const volDryUp = avgVol5 > 0 && avgVol20 > 0 && avgVol5 < avgVol20 * 0.7;
+  const volExpansionSetup = volume < avgVol10 && nearResistance;
+
+  const higherLows =
+    last3Lows.length === 3 &&
+    last3Lows[2] > last3Lows[1] &&
+    last3Lows[1] > last3Lows[0];
+
+  const distanceToEntry = resistance > 0
+    ? Number((((resistance - price) / price) * 100).toFixed(2))
+    : null;
+
+  const proximityToEntry =
+    distanceToEntry !== null &&
+    distanceToEntry > 0 &&
+    distanceToEntry < 0.8;
+
+  const vwap = calculateVWAP(candles);
+  const vwapPinning =
+    vwap > 0 &&
+    Math.abs(price - vwap) / vwap < 0.003;
+
+  const priceFlat =
+    avgRange3 > 0 &&
+    avgRange20 > 0 &&
+    avgRange3 < avgRange20 * 0.65;
+
+  const flagPoleHeight = closes.length >= 15
+    ? Number((((Math.max(...closes.slice(-15)) - Math.min(...closes.slice(-15))) / Math.min(...closes.slice(-15))) * 100).toFixed(2))
+    : 0;
+
+  const consolidationDays = ranges
+    .slice(-15)
+    .filter(r => avgRange20 > 0 && r < avgRange20 * 0.75)
+    .length;
+
+  const flagPole =
+    flagPoleHeight > 5 &&
+    consolidationDays > 3 &&
+    consolidationDays < 15 &&
+    priceFlat;
+
+  const recentHigh20 = Math.max(...highs.slice(-20));
+  const recentLow20 = Math.min(...lows.slice(-20));
+
+  const cupDepth =
+    recentHigh20 > 0
+      ? Number((((recentHigh20 - recentLow20) / recentHigh20) * 100).toFixed(2))
+      : 0;
+
+  const handleVolDry = avgVol5 > 0 && avgVol20 > 0 && avgVol5 < avgVol20 * 0.75;
+
+  const cupHandle =
+    cupDepth > 4 &&
+    cupDepth < 15 &&
+    handleVolDry &&
+    higherLows;
+
   const hasNewsCatalyst = news.length > 0;
   const newsTitle = news[0]?.title || '';
 
   const pattern =
     nearResistance && bullishTrend && volumeSpike
       ? 'High volume breakout setup'
+      : cupHandle
+      ? 'Cup and handle setup'
+      : flagPole
+      ? 'Bull flag setup'
+      : tightRange && volDryUp && proximityToEntry
+      ? 'Coiled pre-breakout setup'
       : nearResistance && bullishTrend
       ? 'Breakout setup'
       : nearSupport && bullishTrend
@@ -230,6 +303,17 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     above200EMA: above200 ? 8 : 0,
     relativeStrength: relativeStrength > 1 ? 12 : 0,
     rvol: rvol >= 2 ? 12 : rvol >= 1.5 ? 8 : 0,
+
+    tightRange: tightRange ? 10 : 0,
+    rangeContraction: rangeContraction ? 8 : 0,
+    volDryUp: volDryUp ? 7 : 0,
+    volExpansionSetup: volExpansionSetup ? 5 : 0,
+    proximityToEntry: proximityToEntry ? 10 : 0,
+    higherLows: higherLows ? 8 : 0,
+    flagPole: flagPole ? 8 : 0,
+    cupHandle: cupHandle ? 10 : 0,
+    vwapPinning: vwapPinning ? 5 : 0,
+
     supportResistance: nearResistance || nearSupport ? 10 : 0,
     pattern: pattern.includes('setup') ? 12 : 0,
     bollingerMiddle: bb.aboveMiddle ? 5 : 0,
@@ -252,7 +336,13 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   let entry = null;
   let stop = null;
 
-  if (pattern === 'High volume breakout setup' || pattern === 'Breakout setup') {
+  if (
+    pattern === 'High volume breakout setup' ||
+    pattern === 'Breakout setup' ||
+    pattern === 'Coiled pre-breakout setup' ||
+    pattern === 'Cup and handle setup' ||
+    pattern === 'Bull flag setup'
+  ) {
     entry = Number((resistance + buffer).toFixed(2));
     stop = Number((Math.min(support - buffer, entry - atr * 1.2)).toFixed(2));
   } else if (pattern === 'Support bounce setup') {
@@ -319,6 +409,29 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     bollinger: bb,
 
     relativeStrength,
+
+    avgRange3,
+    avgRange20,
+    avgVol5,
+    avgVol10,
+    avgVol20,
+
+    tightRange,
+    rangeContraction,
+    volDryUp,
+    volExpansionSetup,
+    distanceToEntry,
+    proximityToEntry,
+    higherLows,
+    flagPoleHeight,
+    consolidationDays,
+    flagPole,
+    cupDepth,
+    handleVolDry,
+    cupHandle,
+    vwap,
+    vwapPinning,
+    priceFlat,
 
     hasNewsCatalyst,
     newsTitle,
@@ -399,6 +512,27 @@ function bollingerBands(values, period = 20, multiplier = 2) {
     aboveMiddle: price > middle,
     nearUpper: price >= upper * 0.98
   };
+}
+
+function avg(values) {
+  if (!values || !values.length) return 0;
+  return Number((values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(2));
+}
+
+function calculateVWAP(candles) {
+  if (!candles || !candles.length) return 0;
+
+  let pv = 0;
+  let vol = 0;
+
+  for (const c of candles) {
+    const typical = (c.h + c.l + c.c) / 3;
+    pv += typical * (c.v || 0);
+    vol += c.v || 0;
+  }
+
+  if (!vol) return 0;
+  return Number((pv / vol).toFixed(2));
 }
 
 function demoStocks(timeframe = '1H') {
