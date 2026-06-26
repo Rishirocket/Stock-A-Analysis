@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -14,8 +13,7 @@ const CONFIG = {
   delayedDataMode: true,
   optionsMode: false,
   cacheSeconds: 60,
-  maxConcurrentRequests: 8,
-  defaultTickers: ['SPY','QQQ','QCOM','AMD','NVDA','RGTI','IONQ','SOFI','PLTR','TSLA']
+  maxConcurrentRequests: 10
 };
 
 const API_KEY = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '';
@@ -42,9 +40,7 @@ async function polygon(pathname) {
   const url = `https://api.polygon.io${pathname}${pathname.includes('?') ? '&' : '?'}apiKey=${API_KEY}`;
   const response = await fetch(url);
 
-  if (!response.ok) {
-    throw new Error(`Polygon/Massive API error ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`Polygon/Massive API error ${response.status}`);
 
   return response.json();
 }
@@ -86,6 +82,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     hasApiKey: Boolean(API_KEY),
+    totalSymbols: symbols.length,
     delayedDataMode: CONFIG.delayedDataMode,
     delayMinutes: CONFIG.dataDelayMinutes
   });
@@ -98,9 +95,9 @@ app.get('/api/stocks', async (req, res) => {
 
     const tickers = req.query.tickers
       ? String(req.query.tickers).split(',').map(t => t.trim().toUpperCase()).filter(Boolean)
-      : CONFIG.defaultTickers;
+      : symbols;
 
-    const safeTickers = tickers.length ? tickers : CONFIG.defaultTickers;
+    const safeTickers = tickers.length ? tickers : symbols;
     const cacheKey = `${timeframe}:${safeTickers.join(',')}`;
 
     const cached = cache.get(cacheKey);
@@ -112,6 +109,7 @@ app.get('/api/stocks', async (req, res) => {
       return res.json({
         live: false,
         timeframe,
+        count: symbols.length,
         stocks: demoStocks(timeframe)
       });
     }
@@ -119,59 +117,43 @@ app.get('/api/stocks', async (req, res) => {
     const from = dateAgo(tf.daysBack);
     const to = new Date().toISOString().slice(0, 10);
 
-    const rawResults = await runLimited(
-      safeTickers,
-      CONFIG.maxConcurrentRequests,
-      async ticker => {
-        try {
-          const data = await polygon(
-            `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=${tf.limit}`
-          );
+    const rawResults = await runLimited(safeTickers, CONFIG.maxConcurrentRequests, async ticker => {
+      try {
+        const data = await polygon(
+          `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=${tf.limit}`
+        );
 
-          const candles = data.results || [];
-          if (!candles.length) return null;
+        const candles = data.results || [];
+        if (!candles.length) return null;
 
-          const latest = candles[0];
-          const previous = candles[1] || latest;
-          const orderedCandles = candles.slice().reverse();
+        const latest = candles[0];
+        const previous = candles[1] || latest;
+        const orderedCandles = candles.slice().reverse();
 
-          const price = Number(latest.c.toFixed(2));
-          const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
-          const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
+        const price = Number(latest.c.toFixed(2));
+        const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
+        const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
 
-          return {
-            ticker,
-            price,
-            change,
-            volume: latest.v || 0,
-            spark,
-            candles: orderedCandles,
-            news: []
-          };
-        } catch (e) {
-          console.error(`Failed ${ticker}:`, e.message);
-          return null;
-        }
+        return {
+          ticker,
+          price,
+          change,
+          volume: latest.v || 0,
+          spark,
+          candles: orderedCandles,
+          news: []
+        };
+      } catch (e) {
+        console.error(`Failed ${ticker}:`, e.message);
+        return null;
       }
-    );
+    });
 
     const raw = rawResults.filter(Boolean);
     const spyChange = raw.find(x => x.ticker === 'SPY')?.change || 0;
 
     const stocks = raw
-      .map(x =>
-        makeStock(
-          x.ticker,
-          x.price,
-          x.change,
-          x.volume,
-          x.spark,
-          timeframe,
-          x.candles,
-          spyChange,
-          x.news
-        )
-      )
+      .map(x => makeStock(x.ticker, x.price, x.change, x.volume, x.spark, timeframe, x.candles, spyChange, x.news))
       .sort((a, b) => b.score - a.score);
 
     const payload = {
@@ -179,8 +161,9 @@ app.get('/api/stocks', async (req, res) => {
       timeframe,
       delayMinutes: CONFIG.dataDelayMinutes,
       delayedDataMode: CONFIG.delayedDataMode,
-      count: stocks.length,
-      stocks: stocks.length ? stocks : demoStocks(timeframe)
+      requestedCount: safeTickers.length,
+      returnedCount: stocks.length,
+      stocks
     };
 
     cache.set(cacheKey, { time: Date.now(), data: payload });
@@ -265,14 +248,10 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const lookbackHighs = highs.slice(-21, -1);
   const lookbackLows = lows.slice(-21, -1);
 
-  const recentHigh = lookbackHighs.length ? Math.max(...lookbackHighs) : price;
-  const recentLow = lookbackLows.length ? Math.min(...lookbackLows) : price;
-
-  const support = Number(recentLow.toFixed(2));
-  const resistance = Number(recentHigh.toFixed(2));
+  const support = Number((lookbackLows.length ? Math.min(...lookbackLows) : price).toFixed(2));
+  const resistance = Number((lookbackHighs.length ? Math.max(...lookbackHighs) : price).toFixed(2));
 
   const avgVolume = avg(volumes);
-  const avgVolumeRounded = Math.round(avgVolume);
   const currentVolume = Math.round(volume);
   const rvol = Number((volume / Math.max(avgVolume, 1)).toFixed(2));
   const volumeSpike = rvol >= 1.5;
@@ -306,10 +285,9 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const avgVol20 = avg(volumes.slice(-20));
   const last3Lows = lows.slice(-3);
 
-  const delayMultiplier = CONFIG.delayedDataMode ? 1.5 : 1.0;
   const entryZoneBuffer = CONFIG.delayedDataMode ? 0.015 : 0.008;
 
-  const tightRange = atr > 0 && oldATR > 0 && atr < oldATR * 0.6 * delayMultiplier;
+  const tightRange = atr > 0 && oldATR > 0 && atr < oldATR * 0.9;
   const rangeContraction = avgRange3 > 0 && avgRange20 > 0 && avgRange3 < avgRange20 * 0.5;
   const volDryUp = avgVol5 > 0 && avgVol20 > 0 && avgVol5 < avgVol20 * 0.7;
   const volExpansionSetup = volume < avgVol10 && nearResistance;
@@ -526,7 +504,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     price,
     change,
     timeframe,
-
     ema9,
     ema21,
     ema50,
@@ -535,13 +512,11 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     above50,
     above100,
     above200,
-
-    avgVolume: avgVolumeRounded,
+    avgVolume: Math.round(avgVolume),
     currentVolume,
     volumeSpike,
     rvol,
     dollarVolume,
-
     entry,
     stop,
     t1,
@@ -549,23 +524,18 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     rr,
     pctToEntry,
     entryZone,
-
     support,
     resistance,
-
     atr,
     oldATR,
     atrExpansion,
-
     bollinger: bb,
     relativeStrength,
-
     avgRange3,
     avgRange20,
     avgVol5,
     avgVol10,
     avgVol20,
-
     tightRange,
     rangeContraction,
     volDryUp,
@@ -583,10 +553,8 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     vwap,
     vwapPinning,
     priceFlat,
-
     hasNewsCatalyst,
     newsTitle,
-
     pattern,
     analysis: `Support $${support} | Resistance $${resistance} | EMA9 $${ema9} | EMA21 $${ema21} | EMA50 $${ema50} | EMA100 $${ema100} | EMA200 $${ema200} | Pattern: ${pattern}`,
     bullishTrend,
@@ -594,7 +562,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     delayedDataMode: CONFIG.delayedDataMode,
     delayMinutes: CONFIG.dataDelayMinutes,
     spark: spark && spark.length ? spark : [],
-
     chartCandles,
     tradePlan
   };
@@ -663,7 +630,7 @@ function buildTradePlan({
   const emaStackBullish = ema9 > ema21 && ema21 > ema50;
   const emaStackBearish = ema9 < ema21 && ema21 < ema50;
 
-  let planStatus = 'WAIT FOR 4H CLOSE';
+  let planStatus = 'WAIT FOR CLOSE';
 
   if (shelfBreakdown) {
     planStatus = 'VP SHELF BREAKDOWN';
@@ -683,7 +650,7 @@ function buildTradePlan({
     planStatus === 'VP SHELF BREAKDOWN'
       ? 'Do not average down. Cut weak shares or hedge.'
       : planStatus === 'PRE-BREAKOUT ADD ZONE'
-      ? 'Valid add zone only if next 4H candle holds above this zone.'
+      ? 'Valid add zone only if next candle holds above this zone.'
       : planStatus.includes('AGGRESSIVE')
       ? 'Small size only until EMA200 confirms.'
       : planStatus.includes('TREND CONFIRMED')
@@ -695,7 +662,6 @@ function buildTradePlan({
     timeframe,
     currentPrice: Number(price.toFixed(2)),
     pattern,
-
     keyLevels: [
       { label: 'VP Shelf / Support', price: shelf },
       { label: 'Breakdown Close', price: breakdownClose },
@@ -710,7 +676,6 @@ function buildTradePlan({
       { label: 'EMA200', price: ema200 || null },
       { label: 'Entry Trigger', price: entryZone?.trigger || null }
     ].filter(x => x.price),
-
     lastCandle: {
       open: Number(lastOpen.toFixed(2)),
       high: Number(lastHigh.toFixed(2)),
@@ -721,19 +686,15 @@ function buildTradePlan({
       bodyLow: Number(bodyLow.toFixed(2)),
       bodyStrengthPct
     },
-
     rules: {
       shelfRegain: `Close >= ${reclaimClose} and candle body accepts above ${shelf}`,
       shelfBreakdown: `Close < ${breakdownClose} or full candle body below ${shelf}`,
       preBreakoutAddZone: `${preBreakoutZoneLow} - ${preBreakoutZoneHigh}`,
       breakoutTrigger: `Close above ${resistance}`,
-      trendConfirmation: ema200 > 0
-        ? `Best confirmation is close above EMA200 ${ema200}`
-        : 'EMA200 not enough data',
-      delayedDataRule: 'Use only closed 4H candles. Ignore wick breaks and 1-minute moves.',
+      trendConfirmation: ema200 > 0 ? `Best confirmation is close above EMA200 ${ema200}` : 'EMA200 not enough data',
+      delayedDataRule: 'Use only closed candles. Ignore wick breaks and 1-minute moves.',
       flowRule: 'Early flow = appears near VP shelf before breakout. Late flow = appears after price reaches resistance.'
     },
-
     tradeLogic: {
       shelfReclaim,
       shelfBreakdown,
@@ -745,7 +706,6 @@ function buildTradePlan({
       emaStackBearish,
       status: planStatus
     },
-
     riskPlan: {
       atr,
       invalidation: shelfBreakdown ? breakdownClose : shelf,
@@ -854,7 +814,7 @@ function calculateVWAP(candles) {
 }
 
 function demoStocks(timeframe = '1H') {
-  return CONFIG.defaultTickers
+  return symbols
     .map((s, i) =>
       makeStock(
         s,
