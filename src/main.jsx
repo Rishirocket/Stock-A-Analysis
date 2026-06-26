@@ -26,6 +26,8 @@ function App(){
   const [scoreSort,setScoreSort]=useState('desc');
   const [selectedStock,setSelectedStock]=useState(null);
 
+  const timeframes = ['5M','15M','1H','4H','1D','1W'];
+
   useEffect(()=>{
     setLoading(true);
     fetch(`/api/stocks?timeframe=${timeframe}`)
@@ -84,7 +86,7 @@ function App(){
       <input placeholder="Search ticker or sector, example: rgti" value={q} onChange={e=>setQ(e.target.value)}/>
 
       <div className="timeframes">
-        {['5M','15M','1H','1D','1W'].map(tf=>(
+        {timeframes.map(tf=>(
           <button key={tf} className={timeframe===tf?'active':''} onClick={()=>setTimeframe(tf)}>
             {tf}
           </button>
@@ -114,6 +116,8 @@ function App(){
 }
 
 function Card({s,onViewPlan}){
+  const planStatus = s.tradePlan?.tradeLogic?.status || s.status;
+
   return <article className={`card ${s.pctToEntry!=null && s.pctToEntry<=1?'pulse':''}`}>
     <div className="cardTop">
       <div>
@@ -146,11 +150,12 @@ function Card({s,onViewPlan}){
       <strong>Quick Analysis</strong><br/>
       Support: {money(s.support)} | Resistance: {money(s.resistance)}<br/>
       Pattern: {s.pattern ?? 'Checking pattern'}<br/>
+      Plan: {planStatus}<br/>
       News: {s.hasNewsCatalyst ? 'Yes' : 'No'} {s.newsTitle ? `• ${s.newsTitle}` : ''}
     </div>
 
     <footer>
-      <span className={s.pctToEntry!=null && s.pctToEntry<=1?'hot':''}>{s.status || 'Watch'}</span>
+      <span className={s.pctToEntry!=null && s.pctToEntry<=1?'hot':''}>{planStatus || 'Watch'}</span>
       <button onClick={()=>onViewPlan(s)}>View Plan</button>
     </footer>
   </article>
@@ -158,19 +163,55 @@ function Card({s,onViewPlan}){
 
 function PlanModal({s,onClose}){
   const breakdown = s.scoreBreakdown || {};
+  const tradePlan = s.tradePlan || {};
+  const keyLevels = tradePlan.keyLevels || [];
+  const rules = tradePlan.rules || {};
+  const logic = tradePlan.tradeLogic || {};
+  const riskPlan = tradePlan.riskPlan || {};
 
   return <div className="modalOverlay">
     <div className="modalCard">
       <div className="modalTop">
         <div>
-          <p className="eyebrow">FULL TRADE ANALYSIS</p>
+          <p className="eyebrow">FULL TRADE ANALYSIS • {s.timeframe}</p>
           <h2>{s.ticker} • {grade(s.score)} {s.score}/100</h2>
-          <span>{s.sector} • {s.status}</span>
+          <span>{s.sector} • {logic.status || s.status}</span>
         </div>
         <button onClick={onClose}>Close</button>
       </div>
 
       <div className="modalGrid">
+        <section className="wide">
+          <h3>Prop-Style Trade Plan</h3>
+          <p>Status: <b>{logic.status || '-'}</b></p>
+          <p>Action: <b>{riskPlan.action || '-'}</b></p>
+          <p>Shelf Reclaim: <b>{logic.shelfReclaim ? 'YES' : 'NO'}</b></p>
+          <p>Shelf Breakdown: <b>{logic.shelfBreakdown ? 'YES' : 'NO'}</b></p>
+          <p>Pre-Breakout Zone: <b>{logic.inPreBreakoutZone ? 'YES' : 'NO'}</b></p>
+          <p>Above Resistance: <b>{logic.aboveResistance ? 'YES' : 'NO'}</b></p>
+          <p>Above EMA200: <b>{logic.aboveEma200 ? 'YES' : 'NO'}</b></p>
+        </section>
+
+        <section className="wide">
+          <h3>Exact Rules</h3>
+          <p>Shelf Regain: <b>{rules.shelfRegain || '-'}</b></p>
+          <p>Shelf Breakdown: <b>{rules.shelfBreakdown || '-'}</b></p>
+          <p>Pre-Breakout Add Zone: <b>{rules.preBreakoutAddZone || '-'}</b></p>
+          <p>Breakout Trigger: <b>{rules.breakoutTrigger || '-'}</b></p>
+          <p>Trend Confirmation: <b>{rules.trendConfirmation || '-'}</b></p>
+          <p>Delayed Data Rule: <b>{rules.delayedDataRule || '-'}</b></p>
+          <p>Flow Rule: <b>{rules.flowRule || '-'}</b></p>
+        </section>
+
+        <section className="wide">
+          <h3>Key Levels</h3>
+          <div className="scoreBreakdown">
+            {keyLevels.map((lvl,i)=>(
+              <p key={i}><span>{lvl.label}</span><b>{money(lvl.price)}</b></p>
+            ))}
+          </div>
+        </section>
+
         <section>
           <h3>Trade Plan</h3>
           <p>Entry: <b>{money(s.entry)}</b></p>
@@ -196,6 +237,7 @@ function PlanModal({s,onClose}){
           <p>EMA 9: <b>{s.ema9}</b></p>
           <p>EMA 21: <b>{s.ema21}</b></p>
           <p>EMA 50: <b>{s.ema50}</b></p>
+          <p>EMA 100: <b>{s.ema100 ?? '-'}</b></p>
           <p>EMA 200: <b>{s.ema200}</b></p>
         </section>
 
@@ -226,7 +268,7 @@ function PlanModal({s,onClose}){
         <section className="wide">
           <h3>News Catalyst</h3>
           <p>News Catalyst: <b>{s.hasNewsCatalyst ? 'YES +10' : 'NO'}</b></p>
-          <p>{s.newsTitle || 'No recent catalyst found from Polygon news.'}</p>
+          <p>{s.newsTitle || 'News loads separately from /api/news/:ticker to keep website fast.'}</p>
         </section>
 
         <section className="wide">
@@ -288,7 +330,7 @@ function Table({rows,scoreSort,setScoreSort,onViewPlan}){
             <td>{money(s.resistance)}</td>
             <td>{s.pattern ?? '-'}</td>
             <td>{s.sector}</td>
-            <td><span className="status">{s.status}</span></td>
+            <td><span className="status">{s.tradePlan?.tradeLogic?.status || s.status}</span></td>
             <td><button onClick={()=>onViewPlan(s)}>View</button></td>
           </tr>
         )}
