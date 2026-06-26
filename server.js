@@ -13,7 +13,8 @@ const CONFIG = {
   delayedDataMode: true,
   optionsMode: false,
   cacheSeconds: 60,
-  maxConcurrentRequests: 10
+  maxConcurrentRequests: 10,
+  volumeProfileBins: 24
 };
 
 const API_KEY = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '';
@@ -36,12 +37,9 @@ const symbols = [
 
 async function polygon(pathname) {
   if (!API_KEY) throw new Error('Missing MASSIVE_API_KEY or POLYGON_API_KEY in Railway Variables');
-
   const url = `https://api.polygon.io${pathname}${pathname.includes('?') ? '&' : '?'}apiKey=${API_KEY}`;
   const response = await fetch(url);
-
   if (!response.ok) throw new Error(`Polygon/Massive API error ${response.status}`);
-
   return response.json();
 }
 
@@ -78,6 +76,20 @@ async function runLimited(items, limit, worker) {
   return results;
 }
 
+function parseFlowInput(flowString = '') {
+  const map = {};
+  if (!flowString) return map;
+
+  flowString.split(',').forEach(item => {
+    const [ticker, flow] = item.split(':').map(x => String(x || '').trim().toUpperCase());
+    if (ticker && ['BULLISH','BEARISH','NEUTRAL'].includes(flow)) {
+      map[ticker] = flow.toLowerCase();
+    }
+  });
+
+  return map;
+}
+
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
@@ -98,9 +110,11 @@ app.get('/api/stocks', async (req, res) => {
       : symbols;
 
     const safeTickers = tickers.length ? tickers : symbols;
-    const cacheKey = `${timeframe}:${safeTickers.join(',')}`;
+    const flowMap = parseFlowInput(req.query.flow || '');
 
+    const cacheKey = `${timeframe}:${safeTickers.join(',')}:${req.query.flow || ''}`;
     const cached = cache.get(cacheKey);
+
     if (cached && Date.now() - cached.time < CONFIG.cacheSeconds * 1000) {
       return res.json(cached.data);
     }
@@ -153,7 +167,18 @@ app.get('/api/stocks', async (req, res) => {
     const spyChange = raw.find(x => x.ticker === 'SPY')?.change || 0;
 
     const stocks = raw
-      .map(x => makeStock(x.ticker, x.price, x.change, x.volume, x.spark, timeframe, x.candles, spyChange, x.news))
+      .map(x => makeStock(
+        x.ticker,
+        x.price,
+        x.change,
+        x.volume,
+        x.spark,
+        timeframe,
+        x.candles,
+        spyChange,
+        x.news,
+        flowMap[x.ticker] || 'neutral'
+      ))
       .sort((a, b) => b.score - a.score);
 
     const payload = {
@@ -206,7 +231,7 @@ app.listen(PORT, () => {
   console.log(`A+ Stocks running on port ${PORT}`);
 });
 
-function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candles = [], spyChange = 0, news = []) {
+function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candles = [], spyChange = 0, news = [], tradyFlow = 'neutral') {
   const sectorMap = {
     SPY:'ETF', QQQ:'ETF', XBI:'Biotech ETF',
     AAPL:'Technology', MSFT:'Technology', NVDA:'Technology', AMD:'Technology',
@@ -223,20 +248,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     INTC:'Semiconductors', DIS:'Communication', TXN:'Semiconductors',
     RGTI:'Quantum', IONQ:'Quantum', QBTS:'Quantum', QUBT:'Quantum',
     SOUN:'AI', RKLB:'Space', ASTS:'Space', NEE:'Utilities', TE:'Industrials',
-    SOFI:'Financials', HIMS:'Healthcare',
-    RXT:'Software', NVO:'Healthcare', MRNA:'Healthcare', WEN:'Consumer',
-    RUN:'Solar', AAL:'Airlines', TEM:'AI / Healthcare', UBER:'Technology',
-    JBLU:'Airlines', LOW:'Consumer', HON:'Industrials', FOX:'Communication',
-    TER:'Semiconductors', BULL:'Financials', DRAM:'Semiconductors',
-    NOK:'Technology', AIR:'Industrials', 'BRK.B':'Financials',
-    CDW:'Technology', SNOW:'Software', OSCR:'Healthcare',
-    SWKS:'Semiconductors', RDDT:'Social Media', AMKR:'Semiconductors',
-    CRWV:'AI / Cloud', MARA:'Crypto', COIN:'Crypto', HOOD:'Financials',
-    WULF:'Crypto', EOSE:'Energy Storage', NVTS:'Semiconductors',
-    GLXY:'Crypto', HYLN:'Clean Energy', WYFI:'Technology',
-    FPS:'Technology', MRVL:'Semiconductors', ONDS:'Technology',
-    GH:'Healthcare', ILMN:'Healthcare', DELL:'Technology',
-    CBRS:'Technology', BE:'Clean Energy'
+    SOFI:'Financials', HIMS:'Healthcare'
   };
 
   const closes = candles.length ? candles.map(c => c.c) : spark || [];
@@ -245,11 +257,12 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const volumes = candles.length ? candles.map(c => c.v || 0) : [volume || 0];
   const ranges = candles.length ? candles.map(c => c.h - c.l) : [];
 
-  const lookbackHighs = highs.slice(-21, -1);
-  const lookbackLows = lows.slice(-21, -1);
+  const volumeProfile = calculateVolumeProfile(candles, CONFIG.volumeProfileBins);
+  const horizontalSR = calculateHorizontalSR(candles);
+  const verticalSR = calculateVerticalSR(candles);
 
-  const support = Number((lookbackLows.length ? Math.min(...lookbackLows) : price).toFixed(2));
-  const resistance = Number((lookbackHighs.length ? Math.max(...lookbackHighs) : price).toFixed(2));
+  const support = volumeProfile.nearestSupport || horizontalSR.support;
+  const resistance = volumeProfile.nearestResistance || horizontalSR.resistance;
 
   const avgVolume = avg(volumes);
   const currentVolume = Math.round(volume);
@@ -353,9 +366,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     handleVolDry &&
     higherLows;
 
-  const hasNewsCatalyst = news.length > 0;
-  const newsTitle = news[0]?.title || '';
-
   const pattern =
     nearResistance && bullishTrend && volumeSpike
       ? 'High volume breakout setup'
@@ -376,40 +386,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
       : change < -1.5
       ? 'Pullback / wait'
       : 'No clean setup';
-
-  const scoreBreakdown = {
-    bullishTrend: bullishTrend ? 15 : 0,
-    above50EMA: above50 ? 8 : 0,
-    above100EMA: above100 ? 6 : 0,
-    above200EMA: above200 ? 8 : 0,
-    relativeStrength: relativeStrength > 1 ? 12 : 0,
-    tightRange: tightRange ? 12 : 0,
-    rangeContraction: rangeContraction ? 10 : 0,
-    higherLows: higherLows ? 10 : 0,
-    volDryUp: volDryUp ? 10 : 0,
-    volExpansionSetup: volExpansionSetup ? 8 : 0,
-    prePositionZone: prePositionZone ? 15 : 0,
-    proximityToTrigger: proximityToTrigger ? 8 : 0,
-    rvol: rvol >= 2 ? 8 : rvol >= 1.5 ? 5 : 0,
-    pattern: pattern.includes('setup') ? 8 : 0,
-    flagPole: flagPole ? 8 : 0,
-    cupHandle: cupHandle ? 10 : 0,
-    vwapPinning: vwapPinning ? 5 : 0,
-    bollingerMiddle: bb.aboveMiddle ? 5 : 0,
-    bollingerSqueeze: bb.squeeze && bullishTrend ? 8 : 0,
-    newsCatalyst: hasNewsCatalyst ? 10 : 0,
-    liquidity:
-      dollarVolume > 1000000000 ? 10 :
-      dollarVolume > 500000000 ? 7 :
-      dollarVolume > 100000000 ? 4 : 0,
-    atrExpansion: atrExpansion ? 5 : 0,
-    marketETF: ticker === 'SPY' || ticker === 'QQQ' ? 5 : 0,
-    optionsSetupBonus:
-      CONFIG.optionsMode && tightRange && volDryUp && prePositionZone ? 10 : 0
-  };
-
-  let score = Object.values(scoreBreakdown).reduce((a, b) => a + b, 0);
-  score = Math.min(99, Math.round(score));
 
   const buffer = Math.max(atr * 0.1, price * 0.001);
 
@@ -456,27 +432,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     pctToEntry = Number((((entry - price) / price) * 100).toFixed(2));
   }
 
-  const status =
-    !entry ? 'No Setup' :
-    prePositionZone ? 'Pre-Position Watch' :
-    pctToEntry <= 1 ? 'Alert' :
-    pctToEntry <= 3 ? 'Watch' :
-    'Waiting';
-
-  const chartCandles = candles.map(c => ({
-    time: new Date(c.t).toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric'
-    }),
-    timestamp: c.t,
-    open: Number(c.o.toFixed(2)),
-    high: Number(c.h.toFixed(2)),
-    low: Number(c.l.toFixed(2)),
-    close: Number(c.c.toFixed(2)),
-    volume: c.v || 0
-  }));
-
   const tradePlan = buildTradePlan({
     ticker,
     price,
@@ -493,8 +448,54 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     atr,
     entryZone,
     pattern,
-    timeframe
+    timeframe,
+    volumeProfile,
+    horizontalSR,
+    verticalSR,
+    tradyFlow
   });
+
+  const scoreBreakdown = {
+    bullishTrend: bullishTrend ? 15 : 0,
+    above50EMA: above50 ? 8 : 0,
+    above100EMA: above100 ? 6 : 0,
+    above200EMA: above200 ? 8 : 0,
+    relativeStrength: relativeStrength > 1 ? 12 : 0,
+    vpShelfHold: tradePlan.tradeLogic.vpShelfHold ? 12 : 0,
+    vpShelfReclaim: tradePlan.tradeLogic.vpShelfReclaim ? 12 : 0,
+    vpShelfBreakdown: tradePlan.tradeLogic.vpShelfBreakdown ? -20 : 0,
+    highVolumeNodeNearby: volumeProfile.nearHVN ? 8 : 0,
+    lowVolumeNodeRisk: volumeProfile.nearLVN ? -8 : 0,
+    tradyFlowBullish: tradyFlow === 'bullish' ? 12 : 0,
+    tradyFlowBearish: tradyFlow === 'bearish' ? -15 : 0,
+    tightRange: tightRange ? 12 : 0,
+    rangeContraction: rangeContraction ? 10 : 0,
+    higherLows: higherLows ? 10 : 0,
+    volDryUp: volDryUp ? 10 : 0,
+    prePositionZone: prePositionZone ? 15 : 0,
+    proximityToTrigger: proximityToTrigger ? 8 : 0,
+    rvol: rvol >= 2 ? 8 : rvol >= 1.5 ? 5 : 0,
+    pattern: pattern.includes('setup') ? 8 : 0,
+    liquidity:
+      dollarVolume > 1000000000 ? 10 :
+      dollarVolume > 500000000 ? 7 :
+      dollarVolume > 100000000 ? 4 : 0
+  };
+
+  let score = Object.values(scoreBreakdown).reduce((a, b) => a + b, 0);
+  score = Math.max(0, Math.min(99, Math.round(score)));
+
+  const status = tradePlan.tradeLogic.status;
+
+  const chartCandles = candles.map(c => ({
+    time: new Date(c.t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric' }),
+    timestamp: c.t,
+    open: Number(c.o.toFixed(2)),
+    high: Number(c.h.toFixed(2)),
+    low: Number(c.l.toFixed(2)),
+    close: Number(c.c.toFixed(2)),
+    volume: c.v || 0
+  }));
 
   return {
     ticker,
@@ -504,6 +505,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     price,
     change,
     timeframe,
+
     ema9,
     ema21,
     ema50,
@@ -512,11 +514,13 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     above50,
     above100,
     above200,
+
     avgVolume: Math.round(avgVolume),
     currentVolume,
     volumeSpike,
     rvol,
     dollarVolume,
+
     entry,
     stop,
     t1,
@@ -524,18 +528,25 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     rr,
     pctToEntry,
     entryZone,
+
     support,
     resistance,
+    horizontalSR,
+    verticalSR,
+    volumeProfile,
+
     atr,
     oldATR,
     atrExpansion,
     bollinger: bb,
     relativeStrength,
+
     avgRange3,
     avgRange20,
     avgVol5,
     avgVol10,
     avgVol20,
+
     tightRange,
     rangeContraction,
     volDryUp,
@@ -553,10 +564,9 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     vwap,
     vwapPinning,
     priceFlat,
-    hasNewsCatalyst,
-    newsTitle,
+
     pattern,
-    analysis: `Support $${support} | Resistance $${resistance} | EMA9 $${ema9} | EMA21 $${ema21} | EMA50 $${ema50} | EMA100 $${ema100} | EMA200 $${ema200} | Pattern: ${pattern}`,
+    analysis: `VP Shelf $${volumeProfile.activeShelf} | HVN $${volumeProfile.hvn} | LVN $${volumeProfile.lvn} | Support $${support} | Resistance $${resistance} | EMA9 ${ema9} / EMA21 ${ema21} / EMA50 ${ema50} / EMA100 ${ema100} / EMA200 ${ema200} | Flow ${tradyFlow.toUpperCase()} | ${status}`,
     bullishTrend,
     status,
     delayedDataMode: CONFIG.delayedDataMode,
@@ -564,6 +574,116 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     spark: spark && spark.length ? spark : [],
     chartCandles,
     tradePlan
+  };
+}
+
+function calculateVolumeProfile(candles, bins = 24) {
+  if (!candles || candles.length < 5) {
+    return {
+      activeShelf: 0,
+      hvn: 0,
+      lvn: 0,
+      nearestSupport: 0,
+      nearestResistance: 0,
+      nearHVN: false,
+      nearLVN: false,
+      shelves: []
+    };
+  }
+
+  const lows = candles.map(c => c.l);
+  const highs = candles.map(c => c.h);
+  const lastClose = candles.at(-1).c;
+
+  const minPrice = Math.min(...lows);
+  const maxPrice = Math.max(...highs);
+  const step = (maxPrice - minPrice) / bins || 1;
+
+  const profile = Array.from({ length: bins }, (_, i) => ({
+    low: minPrice + step * i,
+    high: minPrice + step * (i + 1),
+    mid: minPrice + step * i + step / 2,
+    volume: 0
+  }));
+
+  for (const c of candles) {
+    const typical = (c.h + c.l + c.c) / 3;
+    const index = Math.min(bins - 1, Math.max(0, Math.floor((typical - minPrice) / step)));
+    profile[index].volume += c.v || 0;
+  }
+
+  const sorted = profile.slice().sort((a, b) => b.volume - a.volume);
+  const hvn = sorted[0];
+  const lvn = profile.slice().filter(x => x.volume > 0).sort((a, b) => a.volume - b.volume)[0] || profile[0];
+
+  const shelves = sorted.slice(0, 5).map(x => ({
+    low: Number(x.low.toFixed(2)),
+    high: Number(x.high.toFixed(2)),
+    mid: Number(x.mid.toFixed(2)),
+    volume: Math.round(x.volume)
+  }));
+
+  const below = shelves.filter(x => x.mid <= lastClose).sort((a, b) => b.mid - a.mid)[0];
+  const above = shelves.filter(x => x.mid > lastClose).sort((a, b) => a.mid - b.mid)[0];
+
+  const activeShelf = shelves
+    .slice()
+    .sort((a, b) => Math.abs(a.mid - lastClose) - Math.abs(b.mid - lastClose))[0];
+
+  return {
+    activeShelf: activeShelf?.mid || Number(lastClose.toFixed(2)),
+    hvn: Number(hvn.mid.toFixed(2)),
+    lvn: Number(lvn.mid.toFixed(2)),
+    nearestSupport: below?.mid || Number(Math.min(...lows.slice(-21)).toFixed(2)),
+    nearestResistance: above?.mid || Number(Math.max(...highs.slice(-21)).toFixed(2)),
+    nearHVN: Math.abs(lastClose - hvn.mid) / lastClose <= 0.015,
+    nearLVN: Math.abs(lastClose - lvn.mid) / lastClose <= 0.015,
+    shelves
+  };
+}
+
+function calculateHorizontalSR(candles) {
+  if (!candles || candles.length < 5) {
+    return { support: 0, resistance: 0 };
+  }
+
+  const highs = candles.map(c => c.h);
+  const lows = candles.map(c => c.l);
+
+  const lookbackHighs = highs.slice(-21, -1);
+  const lookbackLows = lows.slice(-21, -1);
+
+  return {
+    support: Number((lookbackLows.length ? Math.min(...lookbackLows) : lows.at(-1)).toFixed(2)),
+    resistance: Number((lookbackHighs.length ? Math.max(...lookbackHighs) : highs.at(-1)).toFixed(2))
+  };
+}
+
+function calculateVerticalSR(candles) {
+  if (!candles || candles.length < 20) {
+    return {
+      lastHighVolumeTime: null,
+      lastSwingHighTime: null,
+      lastSwingLowTime: null,
+      note: 'Not enough candles'
+    };
+  }
+
+  const recent = candles.slice(-30);
+  const avgVol = avg(recent.map(c => c.v || 0));
+
+  const highVolCandles = recent
+    .filter(c => (c.v || 0) > avgVol * 1.5)
+    .sort((a, b) => b.t - a.t);
+
+  const swingHigh = recent.slice().sort((a, b) => b.h - a.h)[0];
+  const swingLow = recent.slice().sort((a, b) => a.l - b.l)[0];
+
+  return {
+    lastHighVolumeTime: highVolCandles[0] ? new Date(highVolCandles[0].t).toLocaleString() : null,
+    lastSwingHighTime: swingHigh ? new Date(swingHigh.t).toLocaleString() : null,
+    lastSwingLowTime: swingLow ? new Date(swingLow.t).toLocaleString() : null,
+    note: 'Vertical S/R marks important time candles: high volume, swing high, swing low'
   };
 }
 
@@ -583,7 +703,11 @@ function buildTradePlan({
   atr,
   entryZone,
   pattern,
-  timeframe
+  timeframe,
+  volumeProfile,
+  horizontalSR,
+  verticalSR,
+  tradyFlow
 }) {
   const last = candles.at(-1);
   const previous = candles.at(-2);
@@ -600,15 +724,19 @@ function buildTradePlan({
   const candleRange = Math.max(lastHigh - lastLow, 0.01);
   const bodyStrengthPct = Number(((candleBody / candleRange) * 100).toFixed(1));
 
-  const shelf = support;
+  const shelf = volumeProfile.activeShelf || support;
   const reclaimClose = Number((shelf * 1.012).toFixed(2));
   const breakdownClose = Number((shelf * 0.995).toFixed(2));
 
-  const shelfReclaim =
+  const vpShelfHold =
+    lastLow <= shelf &&
+    lastClose > shelf;
+
+  const vpShelfReclaim =
     lastClose >= reclaimClose &&
     (bodyLow > shelf || (lastOpen < shelf && lastClose > shelf));
 
-  const shelfBreakdown =
+  const vpShelfBreakdown =
     lastClose < breakdownClose ||
     bodyHigh < shelf;
 
@@ -630,25 +758,40 @@ function buildTradePlan({
   const emaStackBullish = ema9 > ema21 && ema21 > ema50;
   const emaStackBearish = ema9 < ema21 && ema21 < ema50;
 
+  const flowConfirmedLong =
+    tradyFlow === 'bullish' &&
+    !vpShelfBreakdown &&
+    (vpShelfHold || vpShelfReclaim || inPreBreakoutZone);
+
+  const flowRejectLong =
+    tradyFlow === 'bearish' &&
+    (vpShelfBreakdown || !aboveResistance);
+
   let planStatus = 'WAIT FOR CLOSE';
 
-  if (shelfBreakdown) {
+  if (vpShelfBreakdown) {
     planStatus = 'VP SHELF BREAKDOWN';
-  } else if (shelfReclaim && lastClose < preBreakoutZoneLow) {
-    planStatus = 'SHELF RECLAIMED - WAIT FOR BB MID / EMA ZONE';
+  } else if (vpShelfReclaim && flowConfirmedLong) {
+    planStatus = 'VP SHELF RECLAIM + FLOW CONFIRMATION';
+  } else if (vpShelfReclaim) {
+    planStatus = 'VP SHELF RECLAIMED - WAIT FOR FLOW';
+  } else if (vpShelfHold && tradyFlow === 'bullish') {
+    planStatus = 'VP SHELF HOLD + BULLISH FLOW';
   } else if (inPreBreakoutZone) {
     planStatus = 'PRE-BREAKOUT ADD ZONE';
-  } else if (lastClose > preBreakoutZoneHigh && lastClose < resistance) {
-    planStatus = 'HOLDING ABOVE EMA50 - WATCH RESISTANCE';
   } else if (aboveResistance && belowEma200) {
     planStatus = 'AGGRESSIVE LONG ONLY - BELOW EMA200';
   } else if (aboveResistance && aboveEma200) {
     planStatus = 'TREND CONFIRMED ABOVE EMA200';
+  } else if (flowRejectLong) {
+    planStatus = 'BEARISH FLOW - DO NOT CHASE';
   }
 
   const action =
     planStatus === 'VP SHELF BREAKDOWN'
       ? 'Do not average down. Cut weak shares or hedge.'
+      : planStatus.includes('FLOW CONFIRMATION') || planStatus.includes('BULLISH FLOW')
+      ? 'Valid long only on closed candle confirmation.'
       : planStatus === 'PRE-BREAKOUT ADD ZONE'
       ? 'Valid add zone only if next candle holds above this zone.'
       : planStatus.includes('AGGRESSIVE')
@@ -662,20 +805,33 @@ function buildTradePlan({
     timeframe,
     currentPrice: Number(price.toFixed(2)),
     pattern,
+    strategyIncluded: {
+      visibleVolumeProfileShelves: true,
+      horizontalSupportResistance: true,
+      verticalSupportResistance: true,
+      emaStack: true,
+      tradyFlow: tradyFlow !== 'neutral' ? 'manual input included' : 'neutral / no manual flow input',
+      delayedDataRule: true
+    },
     keyLevels: [
-      { label: 'VP Shelf / Support', price: shelf },
-      { label: 'Breakdown Close', price: breakdownClose },
-      { label: 'Reclaim Close', price: reclaimClose },
+      { label: 'VP Active Shelf', price: shelf },
+      { label: 'HVN High Volume Node', price: volumeProfile.hvn },
+      { label: 'LVN Low Volume Node', price: volumeProfile.lvn },
+      { label: 'VP Breakdown Close', price: breakdownClose },
+      { label: 'VP Reclaim Close', price: reclaimClose },
+      { label: 'Horizontal Support', price: horizontalSR.support },
+      { label: 'Horizontal Resistance', price: horizontalSR.resistance },
       { label: 'BB Mid', price: bb.middle || null },
       { label: 'VWAP', price: vwap || null },
       { label: 'EMA9', price: ema9 || null },
       { label: 'EMA21', price: ema21 || null },
       { label: 'EMA50', price: ema50 || null },
       { label: 'EMA100', price: ema100 || null },
-      { label: 'Resistance', price: resistance },
       { label: 'EMA200', price: ema200 || null },
       { label: 'Entry Trigger', price: entryZone?.trigger || null }
     ].filter(x => x.price),
+    volumeProfile,
+    verticalSR,
     lastCandle: {
       open: Number(lastOpen.toFixed(2)),
       high: Number(lastHigh.toFixed(2)),
@@ -687,28 +843,33 @@ function buildTradePlan({
       bodyStrengthPct
     },
     rules: {
-      shelfRegain: `Close >= ${reclaimClose} and candle body accepts above ${shelf}`,
-      shelfBreakdown: `Close < ${breakdownClose} or full candle body below ${shelf}`,
+      vpShelfHold: `Shelf hold = wick can touch ${shelf}, but candle must close above it`,
+      vpShelfRegain: `Shelf reclaim = close >= ${reclaimClose} and candle body accepts above ${shelf}`,
+      vpShelfBreakdown: `Shelf breakdown = close < ${breakdownClose} or full candle body below ${shelf}`,
       preBreakoutAddZone: `${preBreakoutZoneLow} - ${preBreakoutZoneHigh}`,
       breakoutTrigger: `Close above ${resistance}`,
       trendConfirmation: ema200 > 0 ? `Best confirmation is close above EMA200 ${ema200}` : 'EMA200 not enough data',
-      delayedDataRule: 'Use only closed candles. Ignore wick breaks and 1-minute moves.',
-      flowRule: 'Early flow = appears near VP shelf before breakout. Late flow = appears after price reaches resistance.'
+      tradyFlowRule: 'Bullish flow near VP shelf = early. Bullish flow after resistance = late/chase.',
+      delayedDataRule: 'Use only closed candles. Ignore wick breaks and 1-minute moves.'
     },
     tradeLogic: {
-      shelfReclaim,
-      shelfBreakdown,
+      vpShelfHold,
+      vpShelfReclaim,
+      vpShelfBreakdown,
       inPreBreakoutZone,
       aboveResistance,
       belowEma200,
       aboveEma200,
       emaStackBullish,
       emaStackBearish,
+      tradyFlow,
+      flowConfirmedLong,
+      flowRejectLong,
       status: planStatus
     },
     riskPlan: {
       atr,
-      invalidation: shelfBreakdown ? breakdownClose : shelf,
+      invalidation: vpShelfBreakdown ? breakdownClose : shelf,
       noChaseZone: `${preBreakoutZoneHigh} - ${resistance}`,
       action
     }
@@ -717,7 +878,6 @@ function buildTradePlan({
 
 function ema(values, period) {
   if (!values || !values.length) return 0;
-
   const usable = values.filter(v => typeof v === 'number' && Number.isFinite(v));
   if (!usable.length) return 0;
 
@@ -750,7 +910,6 @@ function calculateATR(candles, period = 14) {
 
   const recent = trs.slice(-period);
   const atr = recent.reduce((sum, v) => sum + v, 0) / Math.max(recent.length, 1);
-
   return Number(atr.toFixed(2));
 }
 
@@ -790,10 +949,8 @@ function bollingerBands(values, period = 20, multiplier = 2) {
 
 function avg(values) {
   if (!values || !values.length) return 0;
-
   const usable = values.filter(v => typeof v === 'number' && Number.isFinite(v));
   if (!usable.length) return 0;
-
   return Number((usable.reduce((sum, v) => sum + v, 0) / usable.length).toFixed(2));
 }
 
@@ -822,7 +979,11 @@ function demoStocks(timeframe = '1H') {
         -2 + Math.random() * 5,
         1000000 + i,
         null,
-        timeframe
+        timeframe,
+        [],
+        0,
+        [],
+        'neutral'
       )
     )
     .sort((a, b) => b.score - a.score);
