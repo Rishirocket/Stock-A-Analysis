@@ -1,3 +1,4 @@
+// server.js
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,21 +12,14 @@ const PORT = process.env.PORT || 3000;
 const CONFIG = {
   dataDelayMinutes: 15,
   delayedDataMode: true,
-  optionsMode: false
+  optionsMode: false,
+  cacheSeconds: 60,
+  maxConcurrentRequests: 8,
+  defaultTickers: ['SPY','QQQ','QCOM','AMD','NVDA','RGTI','IONQ','SOFI','PLTR','TSLA']
 };
 
 const API_KEY = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '';
-
-async function polygon(pathname) {
-  if (!API_KEY) throw new Error('Missing MASSIVE_API_KEY or POLYGON_API_KEY in Railway Variables');
-
-  const url = `https://api.polygon.io${pathname}${pathname.includes('?') ? '&' : '?'}apiKey=${API_KEY}`;
-  const response = await fetch(url);
-
-  if (!response.ok) throw new Error(`Polygon/Massive API error ${response.status}`);
-
-  return response.json();
-}
+const cache = new Map();
 
 const symbols = [
   'SPY','QQQ','XBI',
@@ -35,7 +29,6 @@ const symbols = [
   'WMT','MCD','ADBE','IBM','GE','CAT','GS','INTC','MRK',
   'DIS','TMO','AMGN','TXN','RGTI','SOUN','NEE','TE','SOFI','HIMS',
   'IONQ','QBTS','RKLB','ASTS','PLTR','MU','SMCI','ARM','CRWD','APP',
-
   'RXT','NVO','MRNA','WEN','RUN','AAL','TEM','UBER','JBLU',
   'LOW','HON','FOX','TER','BULL','DRAM','NOK','AIR','BRK.B',
   'CDW','SNOW','OSCR','SWKS','RDDT','AMKR','CRWV','MARA',
@@ -43,14 +36,28 @@ const symbols = [
   'WYFI','FPS','MRVL','ONDS','GH','ILMN','DELL','CBRS','BE'
 ];
 
+async function polygon(pathname) {
+  if (!API_KEY) throw new Error('Missing MASSIVE_API_KEY or POLYGON_API_KEY in Railway Variables');
+
+  const url = `https://api.polygon.io${pathname}${pathname.includes('?') ? '&' : '?'}apiKey=${API_KEY}`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Polygon/Massive API error ${response.status}`);
+  }
+
+  return response.json();
+}
+
 function timeframeToPolygon(tf) {
-  switch (tf) {
-    case '5M': return { multiplier: 5, timespan: 'minute', daysBack: 3 };
-    case '15M': return { multiplier: 15, timespan: 'minute', daysBack: 5 };
-    case '1H': return { multiplier: 1, timespan: 'hour', daysBack: 10 };
-    case '1W': return { multiplier: 1, timespan: 'week', daysBack: 365 };
-    case '1D':
-    default: return { multiplier: 1, timespan: 'day', daysBack: 120 };
+  switch (String(tf).toUpperCase()) {
+    case '5M': return { multiplier: 5, timespan: 'minute', daysBack: 3, limit: 160 };
+    case '15M': return { multiplier: 15, timespan: 'minute', daysBack: 7, limit: 160 };
+    case '1H': return { multiplier: 1, timespan: 'hour', daysBack: 20, limit: 160 };
+    case '4H': return { multiplier: 4, timespan: 'hour', daysBack: 60, limit: 180 };
+    case '1D': return { multiplier: 1, timespan: 'day', daysBack: 240, limit: 240 };
+    case '1W': return { multiplier: 1, timespan: 'week', daysBack: 730, limit: 160 };
+    default: return { multiplier: 1, timespan: 'hour', daysBack: 20, limit: 160 };
   }
 }
 
@@ -60,92 +67,148 @@ function dateAgo(daysBack) {
   return d.toISOString().slice(0, 10);
 }
 
+async function runLimited(items, limit, worker) {
+  const results = [];
+  let index = 0;
+
+  async function runner() {
+    while (index < items.length) {
+      const currentIndex = index++;
+      results[currentIndex] = await worker(items[currentIndex]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
+}
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    hasApiKey: Boolean(API_KEY),
+    delayedDataMode: CONFIG.delayedDataMode,
+    delayMinutes: CONFIG.dataDelayMinutes
+  });
+});
+
 app.get('/api/stocks', async (req, res) => {
   try {
-    const timeframe = req.query.timeframe || '1H';
+    const timeframe = String(req.query.timeframe || '1H').toUpperCase();
     const tf = timeframeToPolygon(timeframe);
 
-    if (!API_KEY) {
-      return res.json({ live: false, timeframe, stocks: demoStocks(timeframe) });
+    const tickers = req.query.tickers
+      ? String(req.query.tickers).split(',').map(t => t.trim().toUpperCase()).filter(Boolean)
+      : CONFIG.defaultTickers;
+
+    const safeTickers = tickers.length ? tickers : CONFIG.defaultTickers;
+    const cacheKey = `${timeframe}:${safeTickers.join(',')}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.time < CONFIG.cacheSeconds * 1000) {
+      return res.json(cached.data);
     }
 
-    const tickers = (req.query.tickers || symbols.join(','))
-      .split(',')
-      .map(t => t.trim().toUpperCase())
-      .filter(Boolean);
+    if (!API_KEY) {
+      return res.json({
+        live: false,
+        timeframe,
+        stocks: demoStocks(timeframe)
+      });
+    }
 
     const from = dateAgo(tf.daysBack);
     const to = new Date().toISOString().slice(0, 10);
-    const raw = [];
 
-    for (const ticker of tickers) {
-      try {
-        const data = await polygon(
-          `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=80`
-        );
-
-        const candles = data.results || [];
-        if (!candles.length) continue;
-
-        const latest = candles[0];
-        const previous = candles[1] || latest;
-        const orderedCandles = candles.slice().reverse();
-
-        const price = Number(latest.c.toFixed(2));
-        const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
-        const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
-
-        let news = [];
+    const rawResults = await runLimited(
+      safeTickers,
+      CONFIG.maxConcurrentRequests,
+      async ticker => {
         try {
-          const newsData = await polygon(`/v2/reference/news?ticker=${ticker}&limit=3`);
-          news = newsData.results || [];
-        } catch {
-          news = [];
+          const data = await polygon(
+            `/v2/aggs/ticker/${ticker}/range/${tf.multiplier}/${tf.timespan}/${from}/${to}?adjusted=true&sort=desc&limit=${tf.limit}`
+          );
+
+          const candles = data.results || [];
+          if (!candles.length) return null;
+
+          const latest = candles[0];
+          const previous = candles[1] || latest;
+          const orderedCandles = candles.slice().reverse();
+
+          const price = Number(latest.c.toFixed(2));
+          const change = Number((((latest.c - previous.c) / previous.c) * 100).toFixed(2));
+          const spark = orderedCandles.map(c => Number(c.c.toFixed(2)));
+
+          return {
+            ticker,
+            price,
+            change,
+            volume: latest.v || 0,
+            spark,
+            candles: orderedCandles,
+            news: []
+          };
+        } catch (e) {
+          console.error(`Failed ${ticker}:`, e.message);
+          return null;
         }
-
-        raw.push({
-          ticker,
-          price,
-          change,
-          volume: latest.v || 0,
-          spark,
-          candles: orderedCandles,
-          news
-        });
-      } catch (e) {
-        console.error(`Failed ${ticker}:`, e.message);
       }
-    }
+    );
 
+    const raw = rawResults.filter(Boolean);
     const spyChange = raw.find(x => x.ticker === 'SPY')?.change || 0;
 
     const stocks = raw
-      .map(x => makeStock(
-        x.ticker,
-        x.price,
-        x.change,
-        x.volume,
-        x.spark,
-        timeframe,
-        x.candles,
-        spyChange,
-        x.news
-      ))
+      .map(x =>
+        makeStock(
+          x.ticker,
+          x.price,
+          x.change,
+          x.volume,
+          x.spark,
+          timeframe,
+          x.candles,
+          spyChange,
+          x.news
+        )
+      )
       .sort((a, b) => b.score - a.score);
 
-    res.json({
+    const payload = {
       live: true,
       timeframe,
       delayMinutes: CONFIG.dataDelayMinutes,
       delayedDataMode: CONFIG.delayedDataMode,
+      count: stocks.length,
       stocks: stocks.length ? stocks : demoStocks(timeframe)
-    });
+    };
 
+    cache.set(cacheKey, { time: Date.now(), data: payload });
+    res.json(payload);
   } catch (err) {
     res.status(500).json({
       live: false,
       error: err.message,
       stocks: demoStocks(req.query.timeframe || '1H')
+    });
+  }
+});
+
+app.get('/api/news/:ticker', async (req, res) => {
+  try {
+    const ticker = String(req.params.ticker || '').toUpperCase();
+    if (!ticker) return res.json({ ticker, news: [] });
+
+    const data = await polygon(`/v2/reference/news?ticker=${ticker}&limit=5`);
+
+    res.json({
+      ticker,
+      news: data.results || []
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+      news: []
     });
   }
 });
@@ -178,7 +241,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     RGTI:'Quantum', IONQ:'Quantum', QBTS:'Quantum', QUBT:'Quantum',
     SOUN:'AI', RKLB:'Space', ASTS:'Space', NEE:'Utilities', TE:'Industrials',
     SOFI:'Financials', HIMS:'Healthcare',
-
     RXT:'Software', NVO:'Healthcare', MRNA:'Healthcare', WEN:'Consumer',
     RUN:'Solar', AAL:'Airlines', TEM:'AI / Healthcare', UBER:'Technology',
     JBLU:'Airlines', LOW:'Consumer', HON:'Industrials', FOX:'Communication',
@@ -200,8 +262,11 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const volumes = candles.length ? candles.map(c => c.v || 0) : [volume || 0];
   const ranges = candles.length ? candles.map(c => c.h - c.l) : [];
 
-  const recentHigh = Math.max(...highs.slice(-21, -1));
-  const recentLow = Math.min(...lows.slice(-21, -1));
+  const lookbackHighs = highs.slice(-21, -1);
+  const lookbackLows = lows.slice(-21, -1);
+
+  const recentHigh = lookbackHighs.length ? Math.max(...lookbackHighs) : price;
+  const recentLow = lookbackLows.length ? Math.min(...lookbackLows) : price;
 
   const support = Number(recentLow.toFixed(2));
   const resistance = Number(recentHigh.toFixed(2));
@@ -209,7 +274,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const avgVolume = avg(volumes);
   const avgVolumeRounded = Math.round(avgVolume);
   const currentVolume = Math.round(volume);
-
   const rvol = Number((volume / Math.max(avgVolume, 1)).toFixed(2));
   const volumeSpike = rvol >= 1.5;
   const dollarVolume = Number((price * volume).toFixed(0));
@@ -217,6 +281,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const ema9 = ema(closes, 9);
   const ema21 = ema(closes, 21);
   const ema50 = ema(closes, 50);
+  const ema100 = ema(closes, 100);
   const ema200 = ema(closes, 200);
 
   const atr = calculateATR(candles, 14);
@@ -227,6 +292,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
 
   const bullishTrend = ema9 > ema21 && price > ema9;
   const above50 = ema50 ? price > ema50 : false;
+  const above100 = ema100 ? price > ema100 : false;
   const above200 = ema200 ? price > ema200 : false;
 
   const relativeStrength = Number((change - spyChange).toFixed(2));
@@ -268,6 +334,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     distanceToEntry < 0.8;
 
   const vwap = calculateVWAP(candles);
+
   const vwapPinning =
     vwap > 0 &&
     Math.abs(price - vwap) / vwap < 0.003;
@@ -278,7 +345,7 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     avgRange3 < avgRange20 * 0.65;
 
   const flagPoleHeight = closes.length >= 15
-    ? Number((((Math.max(...closes.slice(-15)) - Math.min(...closes.slice(-15))) / Math.min(...closes.slice(-15))) * 100).toFixed(2))
+    ? Number((((Math.max(...closes.slice(-15)) - Math.min(...closes.slice(-15))) / Math.max(Math.min(...closes.slice(-15)), 0.01)) * 100).toFixed(2))
     : 0;
 
   const consolidationDays = ranges
@@ -292,8 +359,8 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     consolidationDays < 15 &&
     priceFlat;
 
-  const recentHigh20 = Math.max(...highs.slice(-20));
-  const recentLow20 = Math.min(...lows.slice(-20));
+  const recentHigh20 = highs.slice(-20).length ? Math.max(...highs.slice(-20)) : price;
+  const recentLow20 = lows.slice(-20).length ? Math.min(...lows.slice(-20)) : price;
 
   const cupDepth =
     recentHigh20 > 0
@@ -335,38 +402,30 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
   const scoreBreakdown = {
     bullishTrend: bullishTrend ? 15 : 0,
     above50EMA: above50 ? 8 : 0,
+    above100EMA: above100 ? 6 : 0,
     above200EMA: above200 ? 8 : 0,
     relativeStrength: relativeStrength > 1 ? 12 : 0,
-
     tightRange: tightRange ? 12 : 0,
     rangeContraction: rangeContraction ? 10 : 0,
     higherLows: higherLows ? 10 : 0,
     volDryUp: volDryUp ? 10 : 0,
     volExpansionSetup: volExpansionSetup ? 8 : 0,
-
     prePositionZone: prePositionZone ? 15 : 0,
     proximityToTrigger: proximityToTrigger ? 8 : 0,
-
     rvol: rvol >= 2 ? 8 : rvol >= 1.5 ? 5 : 0,
     pattern: pattern.includes('setup') ? 8 : 0,
-
     flagPole: flagPole ? 8 : 0,
     cupHandle: cupHandle ? 10 : 0,
     vwapPinning: vwapPinning ? 5 : 0,
-
     bollingerMiddle: bb.aboveMiddle ? 5 : 0,
     bollingerSqueeze: bb.squeeze && bullishTrend ? 8 : 0,
-
     newsCatalyst: hasNewsCatalyst ? 10 : 0,
-
     liquidity:
       dollarVolume > 1000000000 ? 10 :
       dollarVolume > 500000000 ? 7 :
       dollarVolume > 100000000 ? 4 : 0,
-
     atrExpansion: atrExpansion ? 5 : 0,
     marketETF: ticker === 'SPY' || ticker === 'QQQ' ? 5 : 0,
-
     optionsSetupBonus:
       CONFIG.optionsMode && tightRange && volDryUp && prePositionZone ? 10 : 0
   };
@@ -397,16 +456,19 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     pattern === 'Bull flag setup'
   ) {
     entry = entryZone?.trigger || null;
-    stop = Number((Math.min(support - buffer, entry - atr * 1.2)).toFixed(2));
+    stop = entry ? Number((Math.min(support - buffer, entry - atr * 1.2)).toFixed(2)) : null;
   } else if (pattern === 'Support bounce setup') {
-    entry = Number((Math.max(price, highs.at(-1)) + buffer).toFixed(2));
+    entry = Number((Math.max(price, highs.at(-1) || price) + buffer).toFixed(2));
     stop = Number((support - buffer).toFixed(2));
   } else if (pattern === 'Momentum continuation' || pattern === 'Bollinger squeeze bullish') {
-    entry = Number((highs.at(-1) + buffer).toFixed(2));
+    entry = Number(((highs.at(-1) || price) + buffer).toFixed(2));
     stop = Number((Math.max(ema21 - buffer, price - atr * 1.5)).toFixed(2));
   }
 
-  let t1 = null, t2 = null, rr = null, pctToEntry = null;
+  let t1 = null;
+  let t2 = null;
+  let rr = null;
+  let pctToEntry = null;
 
   if (entry && stop && entry > stop) {
     const risk = entry - stop;
@@ -423,20 +485,55 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     pctToEntry <= 3 ? 'Watch' :
     'Waiting';
 
+  const chartCandles = candles.map(c => ({
+    time: new Date(c.t).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric'
+    }),
+    timestamp: c.t,
+    open: Number(c.o.toFixed(2)),
+    high: Number(c.h.toFixed(2)),
+    low: Number(c.l.toFixed(2)),
+    close: Number(c.c.toFixed(2)),
+    volume: c.v || 0
+  }));
+
+  const tradePlan = buildTradePlan({
+    ticker,
+    price,
+    candles,
+    support,
+    resistance,
+    ema9,
+    ema21,
+    ema50,
+    ema100,
+    ema200,
+    bb,
+    vwap,
+    atr,
+    entryZone,
+    pattern,
+    timeframe
+  });
+
   return {
     ticker,
     sector: sectorMap[ticker] || 'Other',
     score,
     scoreBreakdown,
-
     price,
     change,
+    timeframe,
 
     ema9,
     ema21,
     ema50,
+    ema100,
     ema200,
     above50,
+    above100,
     above200,
 
     avgVolume: avgVolumeRounded,
@@ -461,7 +558,6 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     atrExpansion,
 
     bollinger: bb,
-
     relativeStrength,
 
     avgRange3,
@@ -492,22 +588,184 @@ function makeStock(ticker, price, change, volume, spark, timeframe = '1H', candl
     newsTitle,
 
     pattern,
-    analysis: `Support $${support} | Resistance $${resistance} | Pattern: ${pattern}`,
+    analysis: `Support $${support} | Resistance $${resistance} | EMA9 $${ema9} | EMA21 $${ema21} | EMA50 $${ema50} | EMA100 $${ema100} | EMA200 $${ema200} | Pattern: ${pattern}`,
     bullishTrend,
     status,
     delayedDataMode: CONFIG.delayedDataMode,
     delayMinutes: CONFIG.dataDelayMinutes,
-    spark: spark && spark.length ? spark : []
+    spark: spark && spark.length ? spark : [],
+
+    chartCandles,
+    tradePlan
+  };
+}
+
+function buildTradePlan({
+  ticker,
+  price,
+  candles,
+  support,
+  resistance,
+  ema9,
+  ema21,
+  ema50,
+  ema100,
+  ema200,
+  bb,
+  vwap,
+  atr,
+  entryZone,
+  pattern,
+  timeframe
+}) {
+  const last = candles.at(-1);
+  const previous = candles.at(-2);
+
+  const lastOpen = last?.o || price;
+  const lastHigh = last?.h || price;
+  const lastLow = last?.l || price;
+  const lastClose = last?.c || price;
+  const prevClose = previous?.c || lastClose;
+
+  const bodyHigh = Math.max(lastOpen, lastClose);
+  const bodyLow = Math.min(lastOpen, lastClose);
+  const candleBody = Math.abs(lastClose - lastOpen);
+  const candleRange = Math.max(lastHigh - lastLow, 0.01);
+  const bodyStrengthPct = Number(((candleBody / candleRange) * 100).toFixed(1));
+
+  const shelf = support;
+  const reclaimClose = Number((shelf * 1.012).toFixed(2));
+  const breakdownClose = Number((shelf * 0.995).toFixed(2));
+
+  const shelfReclaim =
+    lastClose >= reclaimClose &&
+    (bodyLow > shelf || (lastOpen < shelf && lastClose > shelf));
+
+  const shelfBreakdown =
+    lastClose < breakdownClose ||
+    bodyHigh < shelf;
+
+  const preBreakoutZoneLow = bb.middle > 0
+    ? Number(bb.middle.toFixed(2))
+    : Number((resistance * 0.955).toFixed(2));
+
+  const preBreakoutZoneHigh = ema50 > 0
+    ? Number(ema50.toFixed(2))
+    : Number((resistance * 0.985).toFixed(2));
+
+  const inPreBreakoutZone =
+    lastClose >= preBreakoutZoneLow &&
+    lastClose <= preBreakoutZoneHigh;
+
+  const aboveResistance = lastClose > resistance;
+  const belowEma200 = ema200 > 0 && lastClose < ema200;
+  const aboveEma200 = ema200 > 0 && lastClose > ema200;
+  const emaStackBullish = ema9 > ema21 && ema21 > ema50;
+  const emaStackBearish = ema9 < ema21 && ema21 < ema50;
+
+  let planStatus = 'WAIT FOR 4H CLOSE';
+
+  if (shelfBreakdown) {
+    planStatus = 'VP SHELF BREAKDOWN';
+  } else if (shelfReclaim && lastClose < preBreakoutZoneLow) {
+    planStatus = 'SHELF RECLAIMED - WAIT FOR BB MID / EMA ZONE';
+  } else if (inPreBreakoutZone) {
+    planStatus = 'PRE-BREAKOUT ADD ZONE';
+  } else if (lastClose > preBreakoutZoneHigh && lastClose < resistance) {
+    planStatus = 'HOLDING ABOVE EMA50 - WATCH RESISTANCE';
+  } else if (aboveResistance && belowEma200) {
+    planStatus = 'AGGRESSIVE LONG ONLY - BELOW EMA200';
+  } else if (aboveResistance && aboveEma200) {
+    planStatus = 'TREND CONFIRMED ABOVE EMA200';
+  }
+
+  const action =
+    planStatus === 'VP SHELF BREAKDOWN'
+      ? 'Do not average down. Cut weak shares or hedge.'
+      : planStatus === 'PRE-BREAKOUT ADD ZONE'
+      ? 'Valid add zone only if next 4H candle holds above this zone.'
+      : planStatus.includes('AGGRESSIVE')
+      ? 'Small size only until EMA200 confirms.'
+      : planStatus.includes('TREND CONFIRMED')
+      ? 'Trend-following long is valid.'
+      : 'Wait. No chase. Use only closed candles.';
+
+  return {
+    ticker,
+    timeframe,
+    currentPrice: Number(price.toFixed(2)),
+    pattern,
+
+    keyLevels: [
+      { label: 'VP Shelf / Support', price: shelf },
+      { label: 'Breakdown Close', price: breakdownClose },
+      { label: 'Reclaim Close', price: reclaimClose },
+      { label: 'BB Mid', price: bb.middle || null },
+      { label: 'VWAP', price: vwap || null },
+      { label: 'EMA9', price: ema9 || null },
+      { label: 'EMA21', price: ema21 || null },
+      { label: 'EMA50', price: ema50 || null },
+      { label: 'EMA100', price: ema100 || null },
+      { label: 'Resistance', price: resistance },
+      { label: 'EMA200', price: ema200 || null },
+      { label: 'Entry Trigger', price: entryZone?.trigger || null }
+    ].filter(x => x.price),
+
+    lastCandle: {
+      open: Number(lastOpen.toFixed(2)),
+      high: Number(lastHigh.toFixed(2)),
+      low: Number(lastLow.toFixed(2)),
+      close: Number(lastClose.toFixed(2)),
+      previousClose: Number(prevClose.toFixed(2)),
+      bodyHigh: Number(bodyHigh.toFixed(2)),
+      bodyLow: Number(bodyLow.toFixed(2)),
+      bodyStrengthPct
+    },
+
+    rules: {
+      shelfRegain: `Close >= ${reclaimClose} and candle body accepts above ${shelf}`,
+      shelfBreakdown: `Close < ${breakdownClose} or full candle body below ${shelf}`,
+      preBreakoutAddZone: `${preBreakoutZoneLow} - ${preBreakoutZoneHigh}`,
+      breakoutTrigger: `Close above ${resistance}`,
+      trendConfirmation: ema200 > 0
+        ? `Best confirmation is close above EMA200 ${ema200}`
+        : 'EMA200 not enough data',
+      delayedDataRule: 'Use only closed 4H candles. Ignore wick breaks and 1-minute moves.',
+      flowRule: 'Early flow = appears near VP shelf before breakout. Late flow = appears after price reaches resistance.'
+    },
+
+    tradeLogic: {
+      shelfReclaim,
+      shelfBreakdown,
+      inPreBreakoutZone,
+      aboveResistance,
+      belowEma200,
+      aboveEma200,
+      emaStackBullish,
+      emaStackBearish,
+      status: planStatus
+    },
+
+    riskPlan: {
+      atr,
+      invalidation: shelfBreakdown ? breakdownClose : shelf,
+      noChaseZone: `${preBreakoutZoneHigh} - ${resistance}`,
+      action
+    }
   };
 }
 
 function ema(values, period) {
-  if (!values.length) return 0;
-  const k = 2 / (period + 1);
-  let result = values[0];
+  if (!values || !values.length) return 0;
 
-  for (let i = 1; i < values.length; i++) {
-    result = values[i] * k + result * (1 - k);
+  const usable = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+  if (!usable.length) return 0;
+
+  const k = 2 / (period + 1);
+  let result = usable[0];
+
+  for (let i = 1; i < usable.length; i++) {
+    result = usable[i] * k + result * (1 - k);
   }
 
   return Number(result.toFixed(2));
@@ -572,7 +830,11 @@ function bollingerBands(values, period = 20, multiplier = 2) {
 
 function avg(values) {
   if (!values || !values.length) return 0;
-  return Number((values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(2));
+
+  const usable = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+  if (!usable.length) return 0;
+
+  return Number((usable.reduce((sum, v) => sum + v, 0) / usable.length).toFixed(2));
 }
 
 function calculateVWAP(candles) {
@@ -592,7 +854,7 @@ function calculateVWAP(candles) {
 }
 
 function demoStocks(timeframe = '1H') {
-  return symbols
+  return CONFIG.defaultTickers
     .map((s, i) =>
       makeStock(
         s,
